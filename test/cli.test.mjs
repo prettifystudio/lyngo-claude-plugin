@@ -67,6 +67,7 @@ function handle(req, body) {
   const authed = req.headers.authorization === 'Bearer ' + TOKEN;
   const key = `${req.method} ${url.pathname}`;
   if (key === 'POST /cli/device') {
+    if (state.deviceBroken) return [200, { message: 'not a login answer' }];
     return [200, { device_code: 'dev-1', user_code: 'BCDF-GHJK', verification_url: base + '/cli/activate', verification_url_complete: base + '/cli/activate?code=BCDF-GHJK', interval: 1, expires_in: 900 }];
   }
   if (key === 'POST /cli/token') return next(state.tokenSeq);
@@ -174,7 +175,7 @@ function makeRepo(remote = REMOTE) {
 test('help and version', async () => {
   const h = await run(['--help']);
   assert.equal(h.code, 0);
-  assert.match(h.stdout, /lyngo init \[--languages fr,de\] \[--workspace <name>\] \[--yes\] \[--github\]/);
+  assert.match(h.stdout, /lyngo init \[--languages fr,de\] \[--primary en\] \[--workspace <name>\] \[--yes\] \[--github\]/);
   const v = await run(['--version']);
   assert.equal(v.stdout.trim(), '0.1.0');
 });
@@ -408,4 +409,29 @@ test('localize sends the changed files to the admin MCP endpoint and applies the
   assert.deepEqual(loc.body.params.arguments.files.map((f) => f.path), ['resources/js/Hello.tsx']);
   assert.equal(loc.body.params.arguments.format, 'patch');
   assert.equal(loc.headers['x-lyngo-remote'], REMOTE);
+});
+
+test('init treats --languages as targets: a new project keeps English as its source unless --primary says otherwise', async () => {
+  loggedIn();
+  reset({ projectsSeq: [[201, { status: 'created', project: project({ primary_language: null, languages: [] }), workspace: { id: 'w1', name: 'Acme' } }]], languages: [] });
+  const repo = makeRepo();
+  const r = await run(['init', '--yes', '--languages', 'fr,de'], { cwd: repo, pathDirs: [stubClaude().dir] });
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(calls.find((c) => c.method === 'PATCH').body, { languages: ['en', 'fr', 'de'], primary_language: 'en' });
+});
+
+test('init --primary sets another source language', async () => {
+  loggedIn();
+  reset({ projectsSeq: [[201, { status: 'created', project: project({ primary_language: null, languages: [] }), workspace: { id: 'w1', name: 'Acme' } }]], languages: [] });
+  const r2 = await run(['init', '--yes', '--languages', 'en', '--primary', 'de'], { cwd: makeRepo(), pathDirs: [stubClaude().dir] });
+  assert.equal(r2.code, 0, r2.out);
+  assert.deepEqual(calls.find((c) => c.method === 'PATCH').body, { languages: ['de', 'en'], primary_language: 'de' });
+});
+
+test('login stops with a plain message when the server does not answer with a code', async () => {
+  reset({ deviceBroken: true });
+  const r = await run(['login']);
+  assert.notEqual(r.code, 0);
+  assert.ok(!r.out.includes('undefined'), r.out);
+  assert.match(r.out, /did not answer with a login code/);
 });

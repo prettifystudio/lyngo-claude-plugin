@@ -6,7 +6,7 @@
 //   lyngo login                                   sign in once; the token goes to ~/.config/lyngo/token
 //   lyngo logout                                  revoke the token and delete the file
 //   lyngo whoami                                  who the token belongs to
-//   lyngo init [--languages fr,de] [--workspace <name>] [--yes] [--github]
+//   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github]
 //                                                 connect this repository: project, scaffolding, languages, agent hook
 //   lyngo localize [--languages fr,de] [--dry]    localize + translate the working tree's changes
 //   lyngo check <file>                            the user-facing strings of one file
@@ -160,6 +160,7 @@ function findOnPath(name) {
 
 async function login() {
   const d = expect(await api('POST', '/cli/device', { auth: false, body: { hostname: os.hostname() } }), 200);
+  if (!d || !d.user_code || !d.device_code) fail('the server did not answer with a login code. Check LYNGO_HOST.');
   console.log(`Open ${d.verification_url} and enter ${d.user_code}`);
   openUrl(d.verification_url_complete || d.verification_url);
   let interval = Number(d.interval) > 0 ? Number(d.interval) : 5;
@@ -258,7 +259,9 @@ async function chooseLanguages(project, opts) {
     list = answer ? answer.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean) : current;
   }
   if (!list.length) fail('choose the languages with --languages fr,de.');
-  const primary = project.primary_language || list[0];
+  // --languages names the TARGET languages; the source language stays the
+  // project's primary, English when the project has none yet, or --primary.
+  const primary = opts.primary || project.primary_language || 'en';
   if (!list.includes(primary)) list = [primary, ...list];
   const same = list.length === current.length && list.every((l) => current.includes(l)) && primary === project.primary_language;
   if (same) { console.log(`Languages: ${primary} -> ${list.filter((l) => l !== primary).join(', ') || 'none yet'}`); return project; }
@@ -474,8 +477,9 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
   lyngo login                       sign in once (opens the browser)
   lyngo logout                      revoke the token and delete it from this machine
   lyngo whoami                      who the token belongs to
-  lyngo init [--languages fr,de] [--workspace <name>] [--yes] [--github]
+  lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github]
                                     connect this repository: project, i18n setup, languages, agent hook
+                                    (--languages are the target languages; the source stays en unless --primary)
   lyngo localize [--languages fr,de] [--dry]
                                     localize and translate what changed in the working tree
   lyngo check <file>                the user-facing strings of one file
@@ -485,7 +489,7 @@ Config: LYNGO_HOST (default https://lyngo.app), LYNGO_TOKEN or ~/.config/lyngo/t
 
 function parse(argv) {
   const opts = { _: [] };
-  const valued = new Set(['languages', 'workspace']);
+  const valued = new Set(['languages', 'workspace', 'primary']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-y') { opts.yes = true; continue; }
