@@ -1,0 +1,21 @@
+{
+  "name": "lyngo",
+  "version": "0.1.0",
+  "description": "Localization like code: Lyngo wraps user-facing text, reuses your project's keys and translates the catalogs, from the terminal.",
+  "bin": {
+    "lyngo": "bin/lyngo"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": ["i18n", "localization", "translation", "laravel", "react", "vue", "svelte", "cli"],
+  "homepage": "https://lyngo.app",
+  "license": "MIT"
+}

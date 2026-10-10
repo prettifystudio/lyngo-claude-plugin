@@ -1,0 +1,528 @@
+#!/usr/bin/env node
+// lyngo: the Lyngo CLI for coding agents and people. Zero dependencies, Node 20+.
+// Reads the changed files and the catalogs from disk, asks the Lyngo server,
+// applies the patch, prints a short report. A model never holds the files.
+//
+//   lyngo login                                   sign in once; the token goes to ~/.config/lyngo/token
+//   lyngo logout                                  revoke the token and delete the file
+//   lyngo whoami                                  who the token belongs to
+//   lyngo init [--languages fr,de] [--workspace <name>] [--yes] [--github]
+//                                                 connect this repository: project, scaffolding, languages, agent hook
+//   lyngo localize [--languages fr,de] [--dry]    localize + translate the working tree's changes
+//   lyngo check <file>                            the user-facing strings of one file
+//   lyngo status                                  the project as Lyngo knows it
+//
+// Config: LYNGO_HOST (default https://lyngo.app), LYNGO_URL (MCP endpoint,
+// default $LYNGO_HOST/mcp/admin), LYNGO_TOKEN (or ~/.config/lyngo/token).
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync, spawn } = require('child_process');
+
+const HOST = (process.env.LYNGO_HOST || 'https://lyngo.app').replace(/\/+$/, '');
+const MCP_URL = process.env.LYNGO_URL || HOST + '/mcp/admin';
+const AGENT_MCP_URL = HOST + '/mcp';
+const TOKEN_DIR = path.join(os.homedir(), '.config', 'lyngo');
+const TOKEN_FILE = path.join(TOKEN_DIR, 'token');
+// Milliseconds per protocol second. Tests shrink it; people never set it.
+const TICK = Number(process.env.LYNGO_TICK_MS) > 0 ? Number(process.env.LYNGO_TICK_MS) : 1000;
+const HOOK_COMMAND = 'lyngo localize 2>&1 | tail -20';
+const SRC = /\.(blade\.php|php|tsx|jsx|ts|js|vue|svelte)$/;
+const SKIP = /(^|\/)(vendor|node_modules|tests?|database|storage|bootstrap|public|config|\.git)\//;
+
+class CliError extends Error {}
+
+function fail(msg) { throw new CliError(msg); }
+function die(msg, code = 1) { console.error('lyngo: ' + msg); process.exit(code); }
+const sleep = (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * TICK));
+
+// ── git ────────────────────────────────────────────────────────────────────
+
+function git(args) { return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
+function gitTry(args) { try { return git(args); } catch { return null; } }
+function root() {
+  const top = gitTry(['rev-parse', '--show-toplevel']);
+  if (top === null) fail('not a git repository. Run lyngo inside your project.');
+  return top.trim();
+}
+let remoteCache;
+function repoRemote() {
+  if (remoteCache === undefined) {
+    const inside = gitTry(['rev-parse', '--is-inside-work-tree']);
+    remoteCache = inside && inside.trim() === 'true' ? (gitTry(['remote', 'get-url', 'origin']) || '').trim() || null : null;
+  }
+  return remoteCache;
+}
+
+// ── token ──────────────────────────────────────────────────────────────────
+
+function readToken(required = true) {
+  if (process.env.LYNGO_TOKEN && process.env.LYNGO_TOKEN.trim()) return process.env.LYNGO_TOKEN.trim();
+  if (fs.existsSync(TOKEN_FILE)) {
+    const t = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+    if (t) return t;
+  }
+  if (required) fail('not logged in. Run lyngo login first.');
+  return null;
+}
+const prefixOf = (t) => (t || '').slice(0, 8) + '…';
+function saveToken(t) {
+  fs.mkdirSync(TOKEN_DIR, { recursive: true, mode: 0o700 });
+  fs.chmodSync(TOKEN_DIR, 0o700);
+  fs.writeFileSync(TOKEN_FILE, t + '\n', { mode: 0o600 });
+  fs.chmodSync(TOKEN_FILE, 0o600);
+}
+// Never let a token reach the terminal: replace it with its prefix.
+function scrub(text, t) { return t ? String(text).split(t).join(prefixOf(t)) : String(text); }
+
+// ── HTTP ───────────────────────────────────────────────────────────────────
+
+async function request(method, url, { body, auth = true, accept = 'application/json' } = {}) {
+  const headers = { Accept: accept };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (auth) headers.Authorization = 'Bearer ' + readToken();
+  const remote = repoRemote();
+  if (remote) headers['X-Lyngo-Remote'] = remote;
+  let res;
+  try {
+    res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (e) {
+    fail(`could not reach ${HOST} (${e.cause?.code || e.message}).`);
+  }
+  const text = await res.text();
+  let data = {};
+  if (text) {
+    try { data = JSON.parse(text); } catch {
+      // A streamed MCP answer: the last data line holds the JSON.
+      const line = text.split('\n').filter((l) => l.startsWith('data:')).pop();
+      try { data = line ? JSON.parse(line.slice(5)) : { message: text.slice(0, 200) }; } catch { data = { message: text.slice(0, 200) }; }
+    }
+  }
+  if (auth && res.status === 401) fail('the token was refused (revoked or expired). Run lyngo login.');
+  if (res.status === 429) fail('too many calls. Wait a minute and try again.');
+  return { status: res.status, data };
+}
+const api = (method, p, opts) => request(method, HOST + p, opts);
+const messageOf = (data, status) => data.message || (typeof data.error === 'string' ? data.error : null) || `the server answered ${status}.`;
+function expect(r, ...ok) { if (!ok.includes(r.status)) fail(messageOf(r.data, r.status)); return r.data; }
+
+async function call(name, args) {
+  const r = await request('POST', MCP_URL, {
+    accept: 'application/json, text/event-stream',
+    body: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } },
+  });
+  if (r.status !== 200) fail(messageOf(r.data, r.status));
+  const body = r.data;
+  if (body.error) fail(body.error.message || JSON.stringify(body.error));
+  const text = body.result?.content?.[0]?.text ?? '';
+  if (body.result?.isError) fail(text);
+  try { return JSON.parse(text); } catch { fail('unexpected answer: ' + text.slice(0, 200)); }
+}
+
+// ── terminal helpers ───────────────────────────────────────────────────────
+
+function openUrl(url) {
+  if (process.env.LYNGO_NO_BROWSER) return;
+  const [cmd, args] = process.platform === 'darwin' ? ['open', [url]]
+    : process.platform === 'win32' ? ['cmd', ['/c', 'start', '""', url]]
+    : ['xdg-open', [url]];
+  try {
+    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch { /* the URL is printed; opening it is a convenience */ }
+}
+
+async function ask(question) {
+  if (!process.stdin.isTTY) return null;
+  const rl = require('readline').createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); }));
+}
+async function confirm(question, opts) {
+  if (opts.yes) return true;
+  const answer = await ask(question + ' [Y/n] ');
+  return answer === null ? false : answer === '' || /^y(es)?$/i.test(answer);
+}
+
+function findOnPath(name) {
+  const exts = process.platform === 'win32' ? ['.cmd', '.exe', ''] : [''];
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    for (const ext of exts) {
+      const p = path.join(dir, name + ext);
+      try { fs.accessSync(p, fs.constants.X_OK); if (fs.statSync(p).isFile()) return p; } catch { /* next */ }
+    }
+  }
+  return null;
+}
+
+// ── login, logout, whoami ──────────────────────────────────────────────────
+
+async function login() {
+  const d = expect(await api('POST', '/cli/device', { auth: false, body: { hostname: os.hostname() } }), 200);
+  console.log(`Open ${d.verification_url} and enter ${d.user_code}`);
+  openUrl(d.verification_url_complete || d.verification_url);
+  let interval = Number(d.interval) > 0 ? Number(d.interval) : 5;
+  const deadline = Date.now() + (Number(d.expires_in) > 0 ? Number(d.expires_in) : 900) * TICK;
+  while (Date.now() < deadline) {
+    await sleep(interval);
+    const r = await api('POST', '/cli/token', { auth: false, body: { device_code: d.device_code } });
+    if (r.status === 200 && r.data.token) {
+      saveToken(r.data.token);
+      console.log(`Logged in as ${r.data.user?.email || r.data.user?.name || 'you'}. Token ${r.data.prefix || prefixOf(r.data.token)} saved to ${TOKEN_FILE}.`);
+      if (process.env.LYNGO_TOKEN) console.log('Note: LYNGO_TOKEN is set in your environment and takes precedence over the saved token.');
+      return;
+    }
+    const error = r.data.error;
+    if (error === 'authorization_pending') continue;
+    if (error === 'slow_down') { interval += 5; continue; }
+    if (error === 'access_denied') fail('the login was cancelled in the browser.');
+    if (error === 'expired_token') fail('the code expired. Run lyngo login again.');
+    fail(messageOf(r.data, r.status));
+  }
+  fail('the code expired. Run lyngo login again.');
+}
+
+async function logout() {
+  const t = readToken(false);
+  if (!t) { console.log('Not logged in.'); return; }
+  let revoked = false;
+  try {
+    const r = await api('DELETE', '/cli/token');
+    revoked = r.status === 204 || r.status === 200;
+  } catch { /* the local file goes anyway */ }
+  if (fs.existsSync(TOKEN_FILE)) fs.unlinkSync(TOKEN_FILE);
+  console.log(revoked ? `Logged out. Token ${prefixOf(t)} is revoked.` : `Logged out on this machine. The server did not confirm that token ${prefixOf(t)} is revoked; revoke it in Settings, CLI.`);
+  if (process.env.LYNGO_TOKEN) console.log('Note: LYNGO_TOKEN is still set in your environment.');
+}
+
+async function whoami() {
+  const me = expect(await api('GET', '/cli/me'), 200);
+  console.log(`${me.user?.name || ''} <${me.user?.email || ''}>`.trim());
+  console.log(`token: ${me.token?.prefix || prefixOf(readToken())} (${me.token?.kind || 'unknown'})`);
+  if (me.workspaces?.length) {
+    console.log('workspaces:');
+    for (const w of me.workspaces) console.log(`  ${w.current ? '*' : ' '} ${w.name} (${w.role})`);
+  }
+}
+
+// ── init ───────────────────────────────────────────────────────────────────
+
+function printProblem(r) {
+  console.error('lyngo: ' + messageOf(r.data, r.status));
+  if (r.data.billing_url) console.error('  ' + r.data.billing_url);
+}
+
+async function connectProject(opts, remote, branch) {
+  const body = { remote, branch, workspace: opts.workspace };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await api('POST', '/cli/projects', { body });
+    const s = r.data.status;
+    if ((r.status === 200 || r.status === 201) && r.data.project) return r.data;
+    if (s === 'needs_github_app' || r.status === 409) {
+      console.log(messageOf(r.data, r.status));
+      if (r.data.connect_url) console.log('  ' + r.data.connect_url);
+      if (!r.data.owner) { process.exitCode = 1; return null; }
+      if (opts.github || await confirm('Open it now?', opts)) openUrl(r.data.connect_url);
+      console.log('Waiting for GitHub (up to 10 minutes)...');
+      const q = new URLSearchParams({ remote, ...(opts.workspace ? { workspace: opts.workspace } : {}) });
+      let connected = false;
+      for (let waited = 0; waited < 600 && !connected; waited += 5) {
+        await sleep(5);
+        const st = expect(await api('GET', '/cli/projects/status?' + q), 200);
+        connected = !!st.github_connected;
+      }
+      if (!connected) fail('GitHub is still not connected after 10 minutes. Run lyngo init again once it is.');
+      console.log('GitHub is connected.');
+      continue;
+    }
+    printProblem(r);
+    process.exitCode = 1;
+    return null;
+  }
+  fail('GitHub reports the repository as connected, but Lyngo cannot see it yet. Run lyngo init again in a minute.');
+}
+
+function detectionWarning(branch) {
+  const ahead = gitTry(['rev-list', '--count', '@{u}..HEAD']);
+  const notPushed = ahead === null || Number(ahead.trim()) > 0;
+  const pkgDirty = (gitTry(['status', '--porcelain', '--', 'package.json']) || '').trim() !== '';
+  if (notPushed || pkgDirty) console.log(`Detection reads ${branch} on GitHub. Push first for an exact result.`);
+}
+
+async function chooseLanguages(project, opts) {
+  const current = project.languages || [];
+  let list = opts.languages;
+  if (!list) {
+    const answer = opts.yes ? null : await ask(`Languages [${current.join(',') || 'none'}]: `);
+    list = answer ? answer.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean) : current;
+  }
+  if (!list.length) fail('choose the languages with --languages fr,de.');
+  const primary = project.primary_language || list[0];
+  if (!list.includes(primary)) list = [primary, ...list];
+  const same = list.length === current.length && list.every((l) => current.includes(l)) && primary === project.primary_language;
+  if (same) { console.log(`Languages: ${primary} -> ${list.filter((l) => l !== primary).join(', ') || 'none yet'}`); return project; }
+  const r = await api('PATCH', `/cli/projects/${project.id}`, { body: { languages: list, primary_language: primary } });
+  if (r.status !== 200) { printProblem(r); fail('the languages were not saved.'); }
+  const updated = r.data.project || project;
+  console.log(`Languages: ${updated.primary_language || primary} -> ${(updated.languages || list).filter((l) => l !== (updated.primary_language || primary)).join(', ')}`);
+  return updated;
+}
+
+function readIfFile(p) { try { return fs.statSync(p).isFile() ? fs.readFileSync(p, 'utf8') : null; } catch { return null; } }
+
+async function scaffold(project) {
+  const tree = (gitTry(['ls-files', '-z', '--cached', '--others', '--exclude-standard']) || '').split('\0').filter(Boolean);
+  const sent = new Map();
+  for (const p of ['package.json', 'composer.json']) { const c = readIfFile(p); if (c !== null) sent.set(p, c); }
+  for (let round = 0; round <= 3; round++) {
+    const r = await api('POST', `/cli/projects/${project.id}/scaffold`, { body: { tree, files: [...sent].map(([p, content]) => ({ path: p, content })) } });
+    if (r.status === 409 && Array.isArray(r.data.needs)) {
+      let added = 0;
+      for (const p of r.data.needs) {
+        if (sent.has(p)) continue;
+        const c = readIfFile(p);
+        if (c !== null) { sent.set(p, c); added++; }
+      }
+      if (added === 0) fail('the server asked for files this working tree does not have: ' + r.data.needs.slice(0, 5).join(', '));
+      continue;
+    }
+    const d = expect(r, 200);
+    if (!d.patch || !d.patch.trim()) { console.log('Scaffolding: nothing to add.'); return; }
+    const tmp = path.join(os.tmpdir(), `lyngo-scaffold-${Date.now()}.patch`);
+    fs.writeFileSync(tmp, d.patch);
+    try {
+      git(['apply', '--whitespace=nowarn', tmp]);
+    } catch (e) {
+      console.error(`lyngo: the scaffolding patch did not apply (${(e.stderr || '').toString().trim()}). It is at ${tmp}`);
+      process.exitCode = 1;
+      return;
+    }
+    fs.unlinkSync(tmp);
+    console.log('Scaffolding applied:');
+    for (const f of d.files || []) console.log('  ' + f);
+    for (const n of d.notes || []) console.log('  ' + n);
+    if (d.install_command) console.log(`Run ${d.install_command}`);
+    return;
+  }
+  fail('the server kept asking for more files. Run lyngo init again.');
+}
+
+function setUpClaudeCode(top, remote) {
+  const claude = findOnPath('claude');
+  if (!claude) { console.log('Claude Code not found: no agent setup. Run lyngo localize before you commit.'); return; }
+  const t = readToken();
+  const run = (args) => execFileSync(claude, args, { cwd: top, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  try { run(['mcp', 'remove', 'lyngo', '-s', 'local']); } catch { /* not registered yet */ }
+  try {
+    run(['mcp', 'add', '--transport', 'http', '--scope', 'local', 'lyngo', AGENT_MCP_URL,
+      '-H', 'Authorization: Bearer ' + t, '-H', 'X-Lyngo-Remote: ' + remote]);
+  } catch (e) {
+    console.error('lyngo: could not register the Lyngo MCP server in Claude Code (' + scrub(((e.stderr || e.message || '') + '').trim(), t) + ').');
+    process.exitCode = 1;
+  }
+
+  // One Stop hook, in the settings file git does not track.
+  const dir = path.join(top, '.claude');
+  const file = path.join(dir, 'settings.local.json');
+  let settings = {};
+  if (fs.existsSync(file)) {
+    try { settings = JSON.parse(fs.readFileSync(file, 'utf8') || '{}'); } catch {
+      console.error('lyngo: .claude/settings.local.json is not valid JSON; the Stop hook was not added.');
+      process.exitCode = 1;
+      return;
+    }
+  }
+  settings.hooks = settings.hooks || {};
+  const stop = Array.isArray(settings.hooks.Stop) ? settings.hooks.Stop : [];
+  const has = stop.some((group) => (group.hooks || []).some((h) => typeof h.command === 'string' && /\blyngo\b[^|]*\blocalize\b/.test(h.command)));
+  if (!has) {
+    stop.push({ hooks: [{ type: 'command', command: HOOK_COMMAND }] });
+    settings.hooks.Stop = stop;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
+  }
+  let ignored = true;
+  try { execFileSync('git', ['check-ignore', '-q', '.claude/settings.local.json'], { cwd: top, stdio: 'ignore' }); } catch { ignored = false; }
+  if (!ignored) {
+    const rel = (gitTry(['rev-parse', '--git-path', 'info/exclude']) || '.git/info/exclude').trim();
+    const exclude = path.isAbsolute(rel) ? rel : path.join(top, rel);
+    const text = readIfFile(exclude) || '';
+    if (!text.split('\n').includes('.claude/settings.local.json')) {
+      fs.mkdirSync(path.dirname(exclude), { recursive: true });
+      fs.writeFileSync(exclude, text + (text && !text.endsWith('\n') ? '\n' : '') + '.claude/settings.local.json\n');
+    }
+  }
+  console.log(`Claude Code: the lyngo MCP server is registered for this repository, and the Stop hook ${has ? 'was already' : 'is'} in .claude/settings.local.json.`);
+}
+
+async function init(opts) {
+  const top = root();
+  process.chdir(top);
+  readToken();
+  const remote = repoRemote();
+  if (!remote) fail('this repository has no origin remote. Add the GitHub remote first.');
+  const head = (gitTry(['rev-parse', '--abbrev-ref', 'HEAD']) || '').trim();
+  const branch = head && head !== 'HEAD' ? head : undefined;
+
+  const me = expect(await api('GET', '/cli/me'), 200);
+  const ws = (me.workspaces || []).find((w) => opts.workspace ? (w.id === opts.workspace || w.name === opts.workspace) : w.current);
+  if (ws) console.log(`Workspace: ${ws.name}`);
+
+  const found = await connectProject(opts, remote, branch);
+  if (!found) return;
+  let project = found.project;
+  const wsName = found.workspace?.name || ws?.name || '';
+  console.log(found.status === 'created' ? `Created ${project.name} in workspace ${wsName}.` : `Set up on ${project.name} (workspace ${wsName}).`);
+
+  detectionWarning(project.branch || branch || 'the default branch');
+  const detected = expect(await api('POST', `/cli/projects/${project.id}/detect`, { body: {} }), 200);
+  console.log(`Detected: ${detected.summary || 'no i18n setup found'}`);
+  if (detected.i18n) project = { ...project, i18n: detected.i18n };
+
+  project = await chooseLanguages(project, opts);
+  await scaffold(project);
+  setUpClaudeCode(top, remote);
+  console.log('Done. Build as usual; lyngo localize runs when your agent finishes, or run it yourself before committing.');
+}
+
+// ── localize, check, status ────────────────────────────────────────────────
+
+function changedFiles(top) {
+  const lines = git(['status', '--porcelain', '--untracked-files=all']).split('\n').filter(Boolean);
+  const out = new Set();
+  for (const l of lines) {
+    const p = l.slice(3).trim().replace(/^"|"$/g, '');
+    const rel = p.includes(' -> ') ? p.split(' -> ')[1] : p;
+    if (SRC.test(rel) && !SKIP.test(rel) && fs.existsSync(path.join(top, rel))) out.add(rel);
+  }
+  return [...out].sort();
+}
+
+async function localize(opts) {
+  const top = root();
+  process.chdir(top);
+  const status = await call('status', {});
+  const folder = (status.i18n?.catalog_folder || 'lang').replace(/\/+$/, '');
+  const langs = opts.languages || [status.primary_language, ...(status.languages || [])];
+  const catalogs = [];
+  for (const code of langs) {
+    const p = path.join(folder, code + '.json');
+    if (fs.existsSync(p)) catalogs.push({ path: p, content: fs.readFileSync(p, 'utf8') });
+  }
+  let files = changedFiles(top);
+  if (files.length === 0) { console.log('lyngo: nothing changed in the working tree.'); return; }
+  const report = { files: [], added: [], reused: [], languages: {} };
+  while (files.length) {
+    const payload = files.map((p) => ({ path: p, content: fs.readFileSync(p, 'utf8') }));
+    const args = { files: payload, catalogs: catalogs.map((c) => ({ path: c.path, content: fs.existsSync(c.path) ? fs.readFileSync(c.path, 'utf8') : c.content })), format: 'patch' };
+    if (opts.languages) args.languages = opts.languages.filter((l) => l !== status.primary_language);
+    const r = await call('localize', args);
+    if (r.patch && r.patch.trim()) {
+      if (opts.dry) { process.stdout.write(r.patch); }
+      else {
+        const tmp = path.join(os.tmpdir(), 'lyngo-' + Date.now() + '.patch');
+        fs.writeFileSync(tmp, r.patch);
+        try { git(['apply', '--whitespace=nowarn', tmp]); }
+        catch (e) { fail('the patch did not apply (' + (e.stderr || '').toString().trim() + '); it is at ' + tmp); }
+        fs.unlinkSync(tmp);
+      }
+    }
+    for (const f of r.report?.files || []) if (f.wrapped?.length) report.files.push(f);
+    report.added.push(...(r.report?.primary?.added || []));
+    report.reused.push(...(r.report?.primary?.already_there || []));
+    for (const [code, l] of Object.entries(r.report?.languages || {})) {
+      const cur = report.languages[code] || { translated: 0, from_memory: 0, flagged: [] };
+      cur.translated += l.translated || 0; cur.from_memory += l.from_memory || 0; cur.flagged.push(...(l.flagged || []));
+      report.languages[code] = cur;
+    }
+    files = r.deferred || [];
+  }
+  const wrapped = report.files.reduce((n, f) => n + f.wrapped.length, 0);
+  console.log(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.`);
+  for (const f of report.files) console.log(`  ${f.path}: ${f.wrapped.slice(0, 6).map((s) => JSON.stringify(s)).join(', ')}${f.wrapped.length > 6 ? ', …' : ''}`);
+  for (const [code, l] of Object.entries(report.languages)) {
+    const flagged = l.flagged.length ? `; ${l.flagged.length} flagged for review: ${l.flagged.slice(0, 3).map((x) => JSON.stringify(x.key || x)).join(', ')}` : '';
+    console.log(`  ${code}: ${l.translated} translated, ${l.from_memory} from memory${flagged}`);
+  }
+  if (wrapped === 0 && report.added.length === 0) console.log('  Nothing to change: every string a person reads already goes through an i18n call.');
+}
+
+async function check(file) {
+  if (!file) fail('usage: lyngo check <file>');
+  const r = await call('check', { path: file, content: fs.readFileSync(file, 'utf8') });
+  const strings = r.strings || r.user_facing || [];
+  console.log(`${file}: ${strings.length} user-facing string${strings.length === 1 ? '' : 's'}`);
+  for (const s of strings.slice(0, 30)) console.log('  ' + JSON.stringify(typeof s === 'string' ? s : s.value ?? s));
+}
+
+async function status() {
+  const r = await call('status', {});
+  console.log(`${r.project}: ${r.i18n?.framework} / ${r.i18n?.library} / ${r.i18n?.function}(), catalogs in ${r.i18n?.catalog_folder}`);
+  console.log(`languages: ${r.primary_language} -> ${(r.languages || []).join(', ')}`);
+  if (r.refused_strings?.length) console.log(`refused (never localize): ${r.refused_strings.slice(0, 8).map((s) => JSON.stringify(s)).join(', ')}`);
+}
+
+// ── entry ──────────────────────────────────────────────────────────────────
+
+function version() {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '0.1.0'; } catch { return '0.1.0'; }
+}
+
+const HELP = `lyngo ${version()}: localization for your repository, from the terminal.
+
+  lyngo login                       sign in once (opens the browser)
+  lyngo logout                      revoke the token and delete it from this machine
+  lyngo whoami                      who the token belongs to
+  lyngo init [--languages fr,de] [--workspace <name>] [--yes] [--github]
+                                    connect this repository: project, i18n setup, languages, agent hook
+  lyngo localize [--languages fr,de] [--dry]
+                                    localize and translate what changed in the working tree
+  lyngo check <file>                the user-facing strings of one file
+  lyngo status                      the project as Lyngo knows it
+
+Config: LYNGO_HOST (default https://lyngo.app), LYNGO_TOKEN or ~/.config/lyngo/token.`;
+
+function parse(argv) {
+  const opts = { _: [] };
+  const valued = new Set(['languages', 'workspace']);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '-y') { opts.yes = true; continue; }
+    if (a === '-h') { opts.help = true; continue; }
+    if (a === '-v') { opts.version = true; continue; }
+    if (!a.startsWith('--')) { opts._.push(a); continue; }
+    const [k, inline] = a.slice(2).split(/=(.*)/s);
+    if (valued.has(k)) {
+      const v = inline !== undefined ? inline : argv[++i];
+      if (v === undefined || v.startsWith('--')) fail(`--${k} needs a value.`);
+      opts[k] = k === 'languages' ? v.split(',').map((s) => s.trim()).filter(Boolean) : v;
+    } else {
+      opts[k] = true;
+    }
+  }
+  return opts;
+}
+
+(async () => {
+  try {
+    const [cmd, ...rest] = process.argv.slice(2);
+    if (cmd === '--version' || cmd === '-v' || cmd === 'version') { console.log(version()); return; }
+    if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { console.log(HELP); return; }
+    const opts = parse(rest);
+    if (opts.help) { console.log(HELP); return; }
+    switch (cmd) {
+      case 'login': await login(); break;
+      case 'logout': await logout(); break;
+      case 'whoami': await whoami(); break;
+      case 'init': await init(opts); break;
+      case 'localize': await localize(opts); break;
+      case 'check': await check(opts._[0]); break;
+      case 'status': await status(); break;
+      default: console.error(`lyngo: unknown command "${cmd}".\n\n${HELP}`); process.exitCode = 1;
+    }
+  } catch (e) {
+    const t = (() => { try { return readToken(false); } catch { return null; } })();
+    die(scrub(e instanceof CliError ? e.message : (e && e.message) || String(e), t));
+  }
+})();

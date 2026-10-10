@@ -1,0 +1,20 @@
+{
+	"$schema": "https://json.schemastore.org/claude-code-plugin-marketplace.json",
+	"name": "lyngo",
+	"owner": {
+		"name": "Lyngo"
+	},
+	"description": "Lyngo plugins for coding agents",
+	"plugins": [
+		{
+			"name": "lyngo",
+			"displayName": "Lyngo",
+			"source": "./",
+			"description": "Localization like code for coding agents",
+			"homepage": "https://lyngo.app",
+			"license": "MIT",
+			"keywords": ["i18n", "localization", "translation"],
+			"category": "Development"
+		}
+	]
+}

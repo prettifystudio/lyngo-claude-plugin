@@ -1,0 +1,14 @@
+{
+	"$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+	"name": "lyngo",
+	"displayName": "Lyngo",
+	"version": "0.1.0",
+	"description": "Localization like code for coding agents: Lyngo wraps user-facing text, reuses your project's keys, and translates the catalogs with your glossary and rules, before you commit.",
+	"author": {
+		"name": "Lyngo",
+		"url": "https://lyngo.app"
+	},
+	"homepage": "https://lyngo.app",
+	"license": "MIT",
+	"keywords": ["i18n", "localization", "translation", "laravel", "react", "vue", "svelte"]
+}
