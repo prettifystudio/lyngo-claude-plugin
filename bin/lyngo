@@ -452,10 +452,10 @@ async function translateLanguage(code, project) {
     fs.writeFileSync(targetPath, out.content);
     const l = (r.report && r.report.languages && r.report.languages[code]) || {};
     translated += l.translated || 0; memory += l.from_memory || 0; flagged.push(...(l.flagged || []));
-    process.stdout.write(`\r${code}: ${Math.min(i + 100, missing.length)}/${missing.length}`);
+    if (process.stdout.isTTY) process.stdout.write(`\r${code}: ${Math.min(i + 100, missing.length)}/${missing.length}`);
   }
   const flaggedText = flagged.length ? `; ${flagged.length} flagged for review: ${flagged.slice(0, 3).map((x) => JSON.stringify(x.key || x)).join(', ')}` : '';
-  console.log(`\r${code}: ${translated} translated, ${memory} from memory${flaggedText} -> ${targetPath}`);
+  console.log(`${process.stdout.isTTY ? '\r' : ''}${code}: ${translated} translated, ${memory} from memory${flaggedText} -> ${targetPath}`);
 }
 
 // ── onboard: the "copy this into your agent" path ──────────────────────────
