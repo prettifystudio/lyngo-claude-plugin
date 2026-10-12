@@ -8,7 +8,8 @@
 //   lyngo whoami                                  who the token belongs to
 //   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github]
 //                                                 connect this repository: project, scaffolding, languages, agent hook
-//   lyngo localize [--languages fr,de] [--dry]    localize + translate the working tree's changes
+//   lyngo localize [--languages fr,de] [--no-translate] [--dry]
+//                                                 localize (+ translate) the working tree's changes
 //   lyngo check <file>                            the user-facing strings of one file
 //   lyngo status                                  the project as Lyngo knows it
 //
@@ -488,6 +489,8 @@ async function localize(opts) {
     const payload = files.map((p) => ({ path: p, content: fs.readFileSync(p, 'utf8') }));
     const args = { files: payload, catalogs: catalogs.map((c) => ({ path: c.path, content: fs.existsSync(c.path) ? fs.readFileSync(c.path, 'utf8') : c.content })), format: 'patch' };
     if (opts.languages) args.languages = opts.languages.filter((l) => l !== status.primary_language);
+    // --no-translate: keys only, catalogs for translators. Without the flag the project's setting decides.
+    if (opts['no-translate']) args.translate = false;
     const r = await call('localize', args);
     if (r.patch && r.patch.trim()) {
       if (opts.dry) { process.stdout.write(r.patch); }
@@ -512,6 +515,7 @@ async function localize(opts) {
   const wrapped = report.files.reduce((n, f) => n + f.wrapped.length, 0);
   console.log(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.`);
   for (const f of report.files) console.log(`  ${f.path}: ${f.wrapped.slice(0, 6).map((s) => JSON.stringify(s)).join(', ')}${f.wrapped.length > 6 ? ', …' : ''}`);
+  if (opts['no-translate'] || (status.translate_on_localize === false && !Object.keys(report.languages).length)) console.log('  catalogs: not translated (keys only).');
   for (const [code, l] of Object.entries(report.languages)) {
     const flagged = l.flagged.length ? `; ${l.flagged.length} flagged for review: ${l.flagged.slice(0, 3).map((x) => JSON.stringify(x.key || x)).join(', ')}` : '';
     console.log(`  ${code}: ${l.translated} translated, ${l.from_memory} from memory${flagged}`);
@@ -548,8 +552,9 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github]
                                     connect this repository: project, i18n setup, languages, agent hook
                                     (--languages are the target languages; the source stays en unless --primary)
-  lyngo localize [--languages fr,de] [--dry]
-                                    localize and translate what changed in the working tree
+  lyngo localize [--languages fr,de] [--no-translate] [--dry]
+                                    localize what changed in the working tree, and translate it
+                                    (--no-translate: keys only; the project setting "Translate when localizing" is the default)
   lyngo translate <code> [<code>…]  fill every key a language's catalog lacks, from the primary catalog
   lyngo check <file>                the user-facing strings of one file
   lyngo status                      the project as Lyngo knows it

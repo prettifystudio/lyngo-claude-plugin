@@ -187,7 +187,7 @@ test('help and version', async () => {
   assert.equal(h.code, 0);
   assert.match(h.stdout, /lyngo init \[--languages fr,de\] \[--primary en\] \[--workspace <name>\] \[--yes\] \[--github\]/);
   const v = await run(['--version']);
-  assert.equal(v.stdout.trim(), '0.1.0');
+  assert.equal(v.stdout.trim(), JSON.parse(fs.readFileSync(path.resolve(path.dirname(BIN), '..', 'package.json'), 'utf8')).version);
 });
 
 test('login polls through pending and slow_down, then saves the token with mode 600', async () => {
@@ -486,4 +486,15 @@ test('init names the languages that have no catalog yet and says how to fill the
   assert.match(r.stdout, /fr: 2 translated/);
   assert.match(r.stdout, /de: 2 translated/);
   assert.ok(fs.existsSync(path.join(repo, 'lang', 'de.json')));
+});
+
+test('localize --no-translate sends translate: false and says the catalogs were left alone', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  const r = await run(['localize', '--no-translate'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const loc = calls.find((c) => c.path === '/mcp/admin' && c.body.params.name === 'localize');
+  assert.equal(loc.body.params.arguments.translate, false);
+  assert.match(r.stdout, /catalogs: not translated \(keys only\)\./);
 });
