@@ -2,19 +2,27 @@
 	"$schema": "https://json.schemastore.org/claude-code-plugin-marketplace.json",
 	"name": "lyngo",
 	"owner": {
-		"name": "Lyngo"
+		"name": "Prettify Studio"
 	},
 	"description": "Lyngo plugins for coding agents",
 	"plugins": [
 		{
 			"name": "lyngo",
 			"displayName": "Lyngo",
-			"source": "./",
+			"source": {
+				"source": "github",
+				"repo": "prettifystudio/lyngo-claude-plugin"
+			},
 			"description": "Localization like code for coding agents",
 			"homepage": "https://lyngo.app",
 			"license": "MIT",
-			"keywords": ["i18n", "localization", "translation"],
-			"category": "Development"
+			"keywords": [
+				"i18n",
+				"localization",
+				"translation"
+			],
+			"category": "Development",
+			"repository": "https://github.com/prettifystudio/lyngo-claude-plugin"
 		}
 	]
 }

@@ -5,10 +5,19 @@
 	"version": "0.1.0",
 	"description": "Localization like code for coding agents: Lyngo wraps user-facing text, reuses your project's keys, and translates the catalogs with your glossary and rules, before you commit.",
 	"author": {
-		"name": "Lyngo",
+		"name": "Prettify Studio",
 		"url": "https://lyngo.app"
 	},
 	"homepage": "https://lyngo.app",
 	"license": "MIT",
-	"keywords": ["i18n", "localization", "translation", "laravel", "react", "vue", "svelte"]
+	"keywords": [
+		"i18n",
+		"localization",
+		"translation",
+		"laravel",
+		"react",
+		"vue",
+		"svelte"
+	],
+	"repository": "https://github.com/prettifystudio/lyngo-claude-plugin"
 }

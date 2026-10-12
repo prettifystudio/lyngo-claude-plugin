@@ -14,7 +14,7 @@ holds them.
 You need a Lyngo account (lyngo.app) and Node 20 or newer.
 
 ```bash
-npm i -g lyngo
+npm i -g @prettifystudio/lyngo-cli
 lyngo login          # opens the browser once; the token goes to ~/.config/lyngo/token
 cd your-repository
 lyngo init           # project, i18n setup, languages, agent hook

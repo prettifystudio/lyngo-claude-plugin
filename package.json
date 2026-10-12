@@ -1,5 +1,5 @@
 {
-  "name": "lyngo",
+  "name": "@prettifystudio/lyngo-cli",
   "version": "0.1.0",
   "description": "Localization like code: Lyngo wraps user-facing text, reuses your project's keys and translates the catalogs, from the terminal.",
   "bin": {
@@ -15,7 +15,24 @@
   "scripts": {
     "test": "node --test"
   },
-  "keywords": ["i18n", "localization", "translation", "laravel", "react", "vue", "svelte", "cli"],
+  "keywords": [
+    "i18n",
+    "localization",
+    "translation",
+    "laravel",
+    "react",
+    "vue",
+    "svelte",
+    "cli"
+  ],
   "homepage": "https://lyngo.app",
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/prettifystudio/lyngo-claude-plugin"
+  },
+  "author": "Prettify Studio"
 }
