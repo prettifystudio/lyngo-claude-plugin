@@ -96,6 +96,16 @@ function handle(req, body) {
     });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
+  if (key === 'POST /mcp/admin' && body.params.name === 'translate') {
+    // Fills every requested key with "[code] key"; keeps what the caller sent.
+    const a = body.params.arguments;
+    const code = a.languages[0];
+    const target = a.catalogs.find((c) => c.path.endsWith('/' + code + '.json'));
+    const current = JSON.parse(target.content || '{}');
+    for (const k of a.keys) current[k] = `[${code}] ${k}`;
+    const text = JSON.stringify({ catalogs: [{ path: target.path, content: JSON.stringify(current, null, 2) + '\n' }], report: { languages: { [code]: { translated: a.keys.length, from_memory: 0, flagged: [] } } } });
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
+  }
   if (key === 'POST /mcp/admin') {
     const text = JSON.stringify({ project: 'shop', primary_language: 'en', languages: ['fr'], i18n: { framework: 'react', library: 'react-i18next', function: 't', catalog_folder: 'lang' }, refused_strings: [] });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
@@ -434,4 +444,46 @@ test('login stops with a plain message when the server does not answer with a co
   assert.notEqual(r.code, 0);
   assert.ok(!r.out.includes('undefined'), r.out);
   assert.match(r.out, /did not answer with a login code/);
+});
+
+test('translate fills a missing catalog from the primary one, in chunks of 100', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  const en = Object.fromEntries(Array.from({ length: 130 }, (_, i) => [`Key ${i}`, `Key ${i}`]));
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), JSON.stringify(en, null, 2) + '\n');
+  const r = await run(['translate', 'fr'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /fr: 130 translated, 0 from memory -> lang\/fr\.json/);
+  const fr = JSON.parse(fs.readFileSync(path.join(repo, 'lang', 'fr.json'), 'utf8'));
+  assert.equal(Object.keys(fr).length, 130);
+  assert.equal(fr['Key 7'], '[fr] Key 7');
+  const chunks = calls.filter((c) => c.path === '/mcp/admin' && c.body.params.name === 'translate');
+  assert.deepEqual(chunks.map((c) => c.body.params.arguments.keys.length), [100, 30]);
+  // A second run has nothing left to do.
+  const again = await run(['translate', 'fr'], { cwd: repo });
+  assert.match(again.stdout, /fr: complete, 130 keys\./);
+});
+
+test('translate refuses a language the project does not have', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const r = await run(['translate', 'xx'], { cwd: repo });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /xx is not one of the project's languages/);
+});
+
+test('init names the languages that have no catalog yet and says how to fill them', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), JSON.stringify({ Hello: 'Hello', Save: 'Save' }) + '\n');
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'app.ts'), "import './bootstrap';\n");
+  const r = await run(['init', '--languages', 'fr,de', '--yes'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /No catalog yet for fr, de: lang\/<code>\.json is missing, and en\.json holds 2 keys/);
+  // --yes fills them right away.
+  assert.match(r.stdout, /fr: 2 translated/);
+  assert.match(r.stdout, /de: 2 translated/);
+  assert.ok(fs.existsSync(path.join(repo, 'lang', 'de.json')));
 });

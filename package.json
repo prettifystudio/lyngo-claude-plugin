@@ -1,6 +1,6 @@
 {
   "name": "@prettifystudio/lyngo-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Localization like code: Lyngo wraps user-facing text, reuses your project's keys and translates the catalogs, from the terminal.",
   "bin": {
     "lyngo": "bin/lyngo"

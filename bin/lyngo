@@ -386,7 +386,75 @@ async function init(opts) {
   project = await chooseLanguages(project, opts);
   await scaffold(project);
   setUpClaudeCode(top, remote);
+  await fillMissingCatalogs(project, opts);
   console.log('Done. Build as usual; lyngo localize runs when your agent finishes, or run it yourself before committing.');
+}
+
+// A language added today has no catalog in the repository yet; the first
+// `lyngo localize` would create one with the keys of the changed files only
+// (pingcrm, 2026-10-12: 11 of 103 keys). Say so, and fill it on request.
+async function fillMissingCatalogs(project, opts) {
+  const folder = catalogFolder(project);
+  const primary = project.primary_language || 'en';
+  const primaryPath = path.join(folder, primary + '.json');
+  if (!readIfFile(primaryPath)) return;
+  const targets = (project.languages || []).filter((l) => l !== primary);
+  const missing = targets.filter((l) => !readIfFile(path.join(folder, l + '.json')));
+  if (!missing.length) return;
+  const keys = Object.keys(parseCatalog(primaryPath) || {}).length;
+  console.log(`No catalog yet for ${missing.join(', ')}: ${folder}/<code>.json is missing, and ${primary}.json holds ${keys} keys that need translating.`);
+  const go = opts.yes ? 'y' : await ask(`Translate ${missing.length === 1 ? 'it' : 'them'} now? [Y/n] `);
+  if (go !== null && go !== '' && !/^y/i.test(go)) { console.log(`Later: lyngo translate ${missing.join(' ')}`); return; }
+  if (go === null) { console.log(`Run: lyngo translate ${missing.join(' ')}`); return; }
+  for (const code of missing) await translateLanguage(code, project);
+}
+
+function catalogFolder(project) { return ((project.i18n && project.i18n.catalog_folder) || 'lang').replace(/\/+$/, ''); }
+function parseCatalog(p) { try { return JSON.parse(readIfFile(p) || ''); } catch { return null; } }
+
+// ── translate: fill a language's catalog from the primary one ─────────────
+async function translate(opts) {
+  const top = root();
+  process.chdir(top);
+  readToken();
+  const codes = opts._;
+  if (!codes.length) fail('usage: lyngo translate <code> [<code>...]  (fills every key the language lacks)');
+  const st = await call('status', {});
+  const project = { primary_language: st.primary_language, languages: [st.primary_language, ...(st.languages || [])], i18n: st.i18n };
+  for (const code of codes) {
+    if (!project.languages.includes(code)) fail(`${code} is not one of the project's languages (${project.languages.join(', ')}). Add it with lyngo init --languages.`);
+    await translateLanguage(code, project);
+  }
+}
+
+async function translateLanguage(code, project) {
+  const folder = catalogFolder(project);
+  const primary = project.primary_language || 'en';
+  const primaryPath = path.join(folder, primary + '.json');
+  const targetPath = path.join(folder, code + '.json');
+  const source = parseCatalog(primaryPath);
+  if (!source) fail(`${primaryPath} is missing or not valid JSON.`);
+  const current = parseCatalog(targetPath) || {};
+  const missing = Object.keys(source).filter((k) => !(k in current) || String(current[k]).trim() === '');
+  if (!missing.length) { console.log(`${code}: complete, ${Object.keys(source).length} keys.`); return; }
+  let translated = 0, memory = 0, flagged = [];
+  // Chunks keep each request under the server's time; the returned catalog carries forward.
+  for (let i = 0; i < missing.length; i += 100) {
+    const r = await call('translate', {
+      keys: missing.slice(i, i + 100),
+      languages: [code],
+      catalogs: [{ path: primaryPath, content: readIfFile(primaryPath) }, { path: targetPath, content: readIfFile(targetPath) || '{}' }],
+    });
+    const out = (r.catalogs || []).find((c) => c.path === targetPath || c.path.endsWith('/' + code + '.json'));
+    if (!out) fail(`the server returned no catalog for ${code}.`);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, out.content);
+    const l = (r.report && r.report.languages && r.report.languages[code]) || {};
+    translated += l.translated || 0; memory += l.from_memory || 0; flagged.push(...(l.flagged || []));
+    process.stdout.write(`\r${code}: ${Math.min(i + 100, missing.length)}/${missing.length}`);
+  }
+  const flaggedText = flagged.length ? `; ${flagged.length} flagged for review: ${flagged.slice(0, 3).map((x) => JSON.stringify(x.key || x)).join(', ')}` : '';
+  console.log(`\r${code}: ${translated} translated, ${memory} from memory${flaggedText} -> ${targetPath}`);
 }
 
 // ── localize, check, status ────────────────────────────────────────────────
@@ -482,6 +550,7 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
                                     (--languages are the target languages; the source stays en unless --primary)
   lyngo localize [--languages fr,de] [--dry]
                                     localize and translate what changed in the working tree
+  lyngo translate <code> [<code>…]  fill every key a language's catalog lacks, from the primary catalog
   lyngo check <file>                the user-facing strings of one file
   lyngo status                      the project as Lyngo knows it
 
@@ -521,6 +590,7 @@ function parse(argv) {
       case 'whoami': await whoami(); break;
       case 'init': await init(opts); break;
       case 'localize': await localize(opts); break;
+      case 'translate': await translate(opts); break;
       case 'check': await check(opts._[0]); break;
       case 'status': await status(); break;
       default: console.error(`lyngo: unknown command "${cmd}".\n\n${HELP}`); process.exitCode = 1;
