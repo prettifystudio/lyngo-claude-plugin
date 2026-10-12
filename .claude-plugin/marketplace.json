@@ -13,7 +13,7 @@
 				"source": "github",
 				"repo": "prettifystudio/lyngo-claude-plugin"
 			},
-			"description": "Localization like code for coding agents",
+			"description": "Localization for Laravel applications, from the terminal",
 			"homepage": "https://lyngo.app",
 			"license": "MIT",
 			"keywords": [

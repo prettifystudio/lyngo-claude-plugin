@@ -2,7 +2,7 @@
 
 Manual: https://docs.lyngo.app (every page also as Markdown; https://docs.lyngo.app/llms-full.txt for agents).
 
-Localization like code, from your terminal. Your agent builds the product;
+Localization for Laravel applications, from your terminal: Blade, Livewire, PHP, and Inertia with React, Vue or Svelte. Your agent builds the product;
 Lyngo keeps it localized.
 
 When you or your agent add text a person reads, `lyngo localize` wraps it with

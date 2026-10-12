@@ -3,7 +3,7 @@
 	"name": "lyngo",
 	"displayName": "Lyngo",
 	"version": "0.1.0",
-	"description": "Localization like code for coding agents: Lyngo wraps user-facing text, reuses your project's keys, and translates the catalogs with your glossary and rules, before you commit.",
+	"description": "Localization for Laravel applications, from the terminal: Lyngo wraps user-facing text with your framework's i18n call, reuses your project's keys, translates and verifies the catalogs. Blade, Livewire, PHP, and Inertia with React, Vue or Svelte.",
 	"author": {
 		"name": "Prettify Studio",
 		"url": "https://lyngo.app"
