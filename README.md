@@ -1,5 +1,7 @@
 # lyngo
 
+Manual: https://docs.lyngo.app (every page also as Markdown; https://docs.lyngo.app/llms-full.txt for agents).
+
 Localization like code, from your terminal. Your agent builds the product;
 Lyngo keeps it localized.
 
