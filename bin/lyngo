@@ -458,6 +458,145 @@ async function translateLanguage(code, project) {
   console.log(`\r${code}: ${translated} translated, ${memory} from memory${flaggedText} -> ${targetPath}`);
 }
 
+// ── onboard: the "copy this into your agent" path ──────────────────────────
+// Written for an agent to follow: every run does what it can, reports each
+// step to the server under the run id (the page at /start/<id> shows them),
+// and stops with one clear instruction whenever a person must act. The same
+// command, run again, continues from where it stopped.
+const RUN_DIR = path.join(TOKEN_DIR, 'runs');
+function runState(id) { try { return JSON.parse(fs.readFileSync(path.join(RUN_DIR, id + '.json'), 'utf8')); } catch { return {}; } }
+function saveRunState(id, state) { fs.mkdirSync(RUN_DIR, { recursive: true, mode: 0o700 }); fs.writeFileSync(path.join(RUN_DIR, id + '.json'), JSON.stringify(state), { mode: 0o600 }); }
+
+async function onboard(opts) {
+  const id = String(opts.run || '').trim();
+  if (!/^[0-9a-f-]{20,}$/i.test(id)) fail('usage: lyngo onboard --run=<id>  (the id comes from lyngo.app/start)');
+  const again = `lyngo onboard --run=${id}`;
+  const state = runState(id);
+  let projectId = state.project_id || null;
+  const report = async (step, st, detail) => {
+    const body = { step, state: st, detail: detail ? String(detail).slice(0, 480) : undefined, project_id: projectId || undefined };
+    try { body.repo = repoRemote() || undefined; } catch {}
+    try { await api('POST', `/cli/runs/${id}/step`, { auth: !!readToken(false), body }); } catch {}
+  };
+  const stop = (lines) => {
+    console.log('\nWAITING FOR THE PERSON');
+    for (const l of lines) console.log('  ' + l);
+    console.log(`  Then run: ${again}`);
+  };
+  const step = (n, text) => console.log(`\n[${n}/7] ${text}`);
+
+  // 1. The repository: git, a GitHub remote, and Laravel.
+  step(1, 'Checking the repository');
+  let top;
+  try { top = root(); } catch { await report('cli', 'failed', 'not a git repository'); fail('this folder is not a git repository. Ask the person for the root of their Laravel project, then run this command there.'); }
+  process.chdir(top);
+  const remote = repoRemote();
+  if (!remote) { await report('cli', 'failed', 'no origin remote'); fail('this repository has no origin remote on GitHub. Ask the person to push it to GitHub first, then run this command again.'); }
+  const composer = readIfFile('composer.json') || '';
+  if (!/"laravel\/framework"/.test(composer)) { await report('cli', 'failed', 'not a Laravel application'); fail('this is not a Laravel application (no laravel/framework in composer.json). Lyngo is for Laravel for now. Ask the person which folder holds their Laravel app.'); }
+  await report('cli', 'done', `${path.basename(top)} on ${remote}`);
+  console.log(`  ${path.basename(top)}: Laravel, remote ${remote}`);
+
+  // 2. Login: a saved token, a pending code, or a new code.
+  step(2, 'Logging in');
+  let me = null;
+  if (readToken(false)) {
+    const r = await api('GET', '/cli/me');
+    if (r.status === 200) me = r.data.user || r.data;
+  }
+  if (!me) {
+    let pending = state.device;
+    if (pending && pending.expires_at > Date.now()) {
+      for (let i = 0; i < 3 && !me; i++) {
+        const r = await api('POST', '/cli/token', { auth: false, body: { device_code: pending.device_code } });
+        if (r.status === 200 && r.data.token) { saveToken(r.data.token); me = r.data.user || {}; break; }
+        if (r.data.error === 'authorization_pending' || r.data.error === 'slow_down') { await sleep(3); continue; }
+        pending = null; break;
+      }
+    } else pending = null;
+    if (!me) {
+      if (!pending) {
+        const d = expect(await api('POST', '/cli/device', { auth: false, body: { hostname: os.hostname() } }), 200);
+        if (!d || !d.user_code || !d.device_code) fail('the server did not answer with a login code. Check LYNGO_HOST.');
+        pending = { device_code: d.device_code, user_code: d.user_code, url: d.verification_url_complete || d.verification_url, expires_at: Date.now() + (Number(d.expires_in) > 0 ? Number(d.expires_in) : 900) * TICK };
+        saveRunState(id, { ...state, device: pending });
+      }
+      await report('login', 'waiting', `Enter ${pending.user_code} at ${pending.url}`);
+      stop([`Ask the person to open ${pending.url} and enter the code ${pending.user_code}, then confirm.`, 'They need a Lyngo account (lyngo.app); the page lets them sign up first.']);
+      return;
+    }
+  }
+  saveRunState(id, { ...state, device: null, project_id: projectId });
+  await report('login', 'done', me.email || me.name || 'signed in');
+  console.log(`  Logged in as ${me.email || me.name || 'you'}.`);
+
+  // 3. GitHub and the project.
+  step(3, 'Connecting the repository');
+  const head = (gitTry(['rev-parse', '--abbrev-ref', 'HEAD']) || '').trim();
+  const branch = head && head !== 'HEAD' ? head : undefined;
+  const r = await api('POST', '/cli/projects', { body: { remote, branch, workspace: opts.workspace } });
+  let project = null;
+  if ((r.status === 200 || r.status === 201) && r.data.project) project = r.data.project;
+  else if (r.data.status === 'needs_github_app' || r.status === 409) {
+    await report('github', 'waiting', r.data.owner ? 'the GitHub App must cover the repository' : 'the workspace owner must connect GitHub');
+    const lines = r.data.owner
+      ? [`Ask the person to install the Lyngo GitHub app on this repository: ${r.data.connect_url}`, 'On GitHub: the Lyngo app, Configure, Repository access, add the repository.']
+      : [`Ask the person to have the workspace owner connect GitHub for this repository at ${r.data.connect_url || HOST + '/source-control'}.`];
+    stop(lines);
+    return;
+  } else { await report('github', 'failed', messageOf(r.data, r.status)); printProblem(r); fail('the project could not be created. The message above says why.'); }
+  projectId = project.id;
+  saveRunState(id, { ...state, device: null, project_id: projectId });
+  await report('github', 'done', project.full_name || project.name);
+  console.log(`  ${r.data.status === 'created' ? 'Created' : 'Found'} ${project.name}.`);
+
+  // 4. Detection and languages.
+  step(4, 'Detecting the i18n setup');
+  await report('setup', 'running', 'detecting');
+  const detected = expect(await api('POST', `/cli/projects/${project.id}/detect`, { body: {} }), 200);
+  console.log(`  Detected: ${detected.summary || 'no i18n setup found'}`);
+  if (detected.i18n) project = { ...project, i18n: detected.i18n };
+  const primary = opts.primary || project.primary_language || 'en';
+  let targets = (project.languages || []).filter((l) => l !== primary);
+  if (opts.languages) {
+    const list = [primary, ...opts.languages.filter((l) => l !== primary)];
+    const u = await api('PATCH', `/cli/projects/${project.id}`, { body: { languages: list, primary_language: primary } });
+    if (u.status !== 200) { printProblem(u); await report('languages', 'failed', messageOf(u.data, u.status)); fail('the languages were not saved. The message above says why.'); }
+    project = { ...project, ...(u.data.project || {}) };
+    targets = (project.languages || list).filter((l) => l !== primary);
+  }
+  if (!targets.length) {
+    await report('languages', 'waiting', 'which languages to translate into');
+    stop([`Ask the person which languages to translate into (codes such as fr, de, ar, ja), source ${primary}.`, `Then run: ${again} --languages fr,de`]);
+    return;
+  }
+  await report('languages', 'done', `${primary} -> ${targets.join(', ')}`);
+  console.log(`  Languages: ${primary} -> ${targets.join(', ')}`);
+
+  // 5. Setup as a patch, 6. the hook, missing catalogs.
+  step(5, 'Applying the i18n setup');
+  await scaffold(project);
+  await report('setup', 'done', detected.summary || 'ready');
+  step(6, 'Wiring the agent');
+  setUpClaudeCode(top, remote);
+  await report('hook', 'done', findOnPath('claude') ? 'Stop hook and MCP server registered' : 'no Claude Code here; run lyngo localize before committing');
+  await fillMissingCatalogs(project, { yes: true });
+
+  // 7. The first localized change.
+  step(7, 'Localizing a first change');
+  const changed = changedFiles(top);
+  if (!changed.length) {
+    await report('localize', 'waiting', 'make one change, then run again');
+    stop(['Make one change a person can see: add a sentence of plain text to a view or a page component (no i18n call, the CLI adds it).', 'You may do this yourself: pick a page under resources/, add one paragraph of English text.']);
+    return;
+  }
+  const result = await localize({});
+  const summary = result ? `${result.wrapped} strings localized in ${result.files} files; ${result.added} new keys, ${result.reused} reused; ${result.languages} languages filled` : 'nothing to localize in the changed files';
+  await report('localize', 'done', summary);
+  console.log(`\nDONE. ${summary}.`);
+  console.log('Show the person `git diff`, and tell them: build as usual; lyngo localize runs when the agent finishes a task, or by hand before a commit.');
+}
+
 // ── localize, check, status ────────────────────────────────────────────────
 
 function changedFiles(top) {
@@ -483,7 +622,7 @@ async function localize(opts) {
     if (fs.existsSync(p)) catalogs.push({ path: p, content: fs.readFileSync(p, 'utf8') });
   }
   let files = changedFiles(top);
-  if (files.length === 0) { console.log('lyngo: nothing changed in the working tree.'); return; }
+  if (files.length === 0) { console.log('lyngo: nothing changed in the working tree.'); return null; }
   const report = { files: [], added: [], reused: [], languages: {} };
   while (files.length) {
     const payload = files.map((p) => ({ path: p, content: fs.readFileSync(p, 'utf8') }));
@@ -521,6 +660,7 @@ async function localize(opts) {
     console.log(`  ${code}: ${l.translated} translated, ${l.from_memory} from memory${flagged}`);
   }
   if (wrapped === 0 && report.added.length === 0) console.log('  Nothing to change: every string a person reads already goes through an i18n call.');
+  return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length };
 }
 
 async function check(file) {
@@ -552,6 +692,8 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github]
                                     connect this repository: project, i18n setup, languages, agent hook
                                     (--languages are the target languages; the source stays en unless --primary)
+  lyngo onboard --run=<id> [--languages fr,de]
+                                    the guided setup an agent follows, from lyngo.app/start; run it again to continue
   lyngo localize [--languages fr,de] [--no-translate] [--dry]
                                     localize what changed in the working tree, and translate it
                                     (--no-translate: keys only; the project setting "Translate when localizing" is the default)
@@ -563,7 +705,7 @@ Config: LYNGO_HOST (default https://lyngo.app), LYNGO_TOKEN or ~/.config/lyngo/t
 
 function parse(argv) {
   const opts = { _: [] };
-  const valued = new Set(['languages', 'workspace', 'primary']);
+  const valued = new Set(['languages', 'workspace', 'primary', 'run']);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-y') { opts.yes = true; continue; }
@@ -595,6 +737,7 @@ function parse(argv) {
       case 'whoami': await whoami(); break;
       case 'init': await init(opts); break;
       case 'localize': await localize(opts); break;
+      case 'onboard': await onboard(opts); break;
       case 'translate': await translate(opts); break;
       case 'check': await check(opts._[0]); break;
       case 'status': await status(); break;

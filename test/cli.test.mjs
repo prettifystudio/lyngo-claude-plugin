@@ -30,6 +30,7 @@ function reset(over = {}) {
     projectsSeq: [[200, { status: 'found', project: project(), workspace: { id: 'w1', name: 'Acme' } }]],
     statusSeq: [[200, { github_connected: true, project: null }]],
     languages: ['en'],
+    runSteps: [],
     scaffold: (body) => {
       const paths = body.files.map((f) => f.path);
       if (!paths.includes('resources/js/app.ts')) return [409, { needs: ['resources/js/app.ts'] }];
@@ -71,6 +72,7 @@ function handle(req, body) {
     return [200, { device_code: 'dev-1', user_code: 'BCDF-GHJK', verification_url: base + '/cli/activate', verification_url_complete: base + '/cli/activate?code=BCDF-GHJK', interval: 1, expires_in: 900 }];
   }
   if (key === 'POST /cli/token') return next(state.tokenSeq);
+  if (/^POST \/cli\/runs\/[^/]+\/step$/.test(key)) { state.runSteps.push({ ...body, authed }); return [200, { ok: true }]; }
   if (!authed) return [401, { error: 'unauthorized', message: 'Bad token.' }];
   if (key === 'GET /cli/me') {
     return [200, { user: { name: 'Dev', email: 'dev@example.com' }, token: { prefix: TOKEN.slice(0, 8), kind: 'personal' }, workspaces: [{ id: 'w1', name: 'Acme', role: 'owner', current: true }, { id: 'w2', name: 'Side', role: 'developer', current: false }] }];
@@ -497,4 +499,57 @@ test('localize --no-translate sends translate: false and says the catalogs were 
   const loc = calls.find((c) => c.path === '/mcp/admin' && c.body.params.name === 'localize');
   assert.equal(loc.body.params.arguments.translate, false);
   assert.match(r.stdout, /catalogs: not translated \(keys only\)\./);
+});
+
+test('onboard: an agent runs it four times and the person acts twice', async () => {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'composer.json'), '{ "require": { "laravel/framework": "^13.0" } }\n');
+  g(repo, 'add', '.'); g(repo, 'commit', '-q', '-m', 'laravel');
+  const id = '0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b';
+  reset({ tokenSeq: [[400, { error: 'authorization_pending' }]], scaffold: () => [200, { patch: '', files: [] }] });
+
+  // 1. No token: it starts a login and stops with the instruction.
+  let r = await run(['onboard', '--run=' + id], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /\[1\/7\] Checking the repository/);
+  assert.match(r.stdout, /WAITING FOR THE PERSON\n {2}Ask the person to open .*enter the code BCDF-GHJK/);
+  assert.match(r.stdout, new RegExp(`Then run: lyngo onboard --run=${id}`));
+  assert.deepEqual(state.runSteps.map((x) => [x.step, x.state]), [['cli', 'done'], ['login', 'waiting']]);
+
+  // 2. The person confirmed: the pending code is approved, the project is found, languages are missing.
+  state.tokenSeq = [[200, { token: TOKEN, prefix: TOKEN.slice(0, 8), user: { name: 'Dev', email: 'dev@example.com' } }]];
+  state.runSteps = [];
+  r = await run(['onboard', '--run=' + id], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /Logged in as dev@example.com/);
+  assert.match(r.stdout, /Found shop\./);
+  assert.match(r.stdout, /Ask the person which languages to translate into/);
+  assert.deepEqual(state.runSteps.map((x) => [x.step, x.state]), [['cli', 'done'], ['login', 'done'], ['github', 'done'], ['setup', 'running'], ['languages', 'waiting']]);
+  assert.ok(state.runSteps.every((x) => x.step === 'cli' || x.authed), 'steps after the login carry the token');
+
+  // 3. With the languages: setup, hook, and it asks for one change.
+  state.runSteps = [];
+  r = await run(['onboard', '--run=' + id, '--languages', 'fr'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /Languages: en -> fr/);
+  assert.match(r.stdout, /Make one change a person can see/);
+  const steps3 = state.runSteps.map((x) => x.step);
+  assert.ok(['languages', 'setup', 'hook', 'localize'].every((k) => steps3.includes(k)), steps3.join(','));
+  assert.equal(state.runSteps.find((x) => x.step === 'localize').state, 'waiting');
+
+  // 4. One changed file: localized, done.
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  state.runSteps = [];
+  r = await run(['onboard', '--run=' + id, '--languages', 'fr'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /DONE\. 1 strings localized in 1 files; 1 new keys, 0 reused; 1 languages filled\./);
+  assert.equal(state.runSteps.find((x) => x.step === 'localize').state, 'done');
+});
+
+test('onboard refuses a folder that is not a Laravel repository', async () => {
+  const repo = makeRepo();
+  const r = await run(['onboard', '--run=0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b'], { cwd: repo });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /not a Laravel application/);
+  assert.deepEqual(state.runSteps.map((x) => [x.step, x.state]), [['cli', 'failed']]);
 });
