@@ -642,13 +642,19 @@ async function localize(opts) {
   const top = root();
   process.chdir(top);
   const status = await call('status', {});
-  const folder = (status.i18n?.catalog_folder || 'lang').replace(/\/+$/, '');
   const langs = opts.languages || [status.primary_language, ...(status.languages || [])];
-  const catalogs = [];
-  for (const code of langs) {
-    const p = path.join(folder, code + '.json');
-    if (fs.existsSync(p)) catalogs.push({ path: p, content: fs.readFileSync(p, 'utf8') });
-  }
+  // Both catalog folders (Laravel's lang and the frontend's own), read again
+  // before EVERY call: a catalog the previous batch created must go back, or
+  // the server diffs it as new twice (corp1, 2026-10-18: "already exists").
+  const folders = [...new Set([status.i18n?.catalog_folder || 'lang', status.i18n?.js_catalog_folder].filter(Boolean).map((f) => f.replace(/\/+$/, '')))];
+  const catalogsNow = () => {
+    const out = [];
+    for (const folder of folders) for (const code of langs) {
+      const p = path.join(folder, code + '.json');
+      if (fs.existsSync(p)) out.push({ path: p, content: fs.readFileSync(p, 'utf8') });
+    }
+    return out;
+  };
   // --all: the whole repository, not the changed files. The server picks the
   // paths a scan would process out of the tracked tree (its own rules, so
   // the two never drift); the batches of 30 below do the rest (2026-10-18).
@@ -661,7 +667,7 @@ async function localize(opts) {
   while (files.length) {
     batch++;
     const payload = files.map((p) => ({ path: p, content: fs.readFileSync(p, 'utf8') }));
-    const args = { files: payload, catalogs: catalogs.map((c) => ({ path: c.path, content: fs.existsSync(c.path) ? fs.readFileSync(c.path, 'utf8') : c.content })), format: 'patch' };
+    const args = { files: payload, catalogs: catalogsNow(), format: 'patch' };
     if (opts.languages) args.languages = opts.languages.filter((l) => l !== status.primary_language);
     // --no-translate: keys only, catalogs for translators. Without the flag the project's setting decides.
     if (opts['no-translate']) args.translate = false;

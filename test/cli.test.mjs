@@ -91,6 +91,15 @@ function handle(req, body) {
     return [200, { project: project({ languages: body.languages, primary_language: body.primary_language }) }];
   }
   if (key === 'POST /cli/projects/p1/scaffold') return state.scaffold(body);
+  if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeTwoBatches) {
+    // First call: a catalog is created and one file is deferred. Second call: that catalog must come back.
+    const sent = body.params.arguments.catalogs.map((c) => c.path);
+    const first = !sent.includes('lang/fr.json');
+    const text = JSON.stringify(first
+      ? { patch: ['diff --git a/lang/fr.json b/lang/fr.json', 'new file mode 100644', '--- /dev/null', '+++ b/lang/fr.json', '@@ -0,0 +1,3 @@', '+{', '+    "Hello": "Bonjour"', '+}', ''].join('\n'), report: { files: [{ path: body.params.arguments.files[0].path, wrapped: ['Hello'] }], primary: { added: ['Hello'], already_there: [] }, languages: { fr: { translated: 1, from_memory: 0, flagged: [] } } }, deferred: ['resources/js/app.ts'] }
+      : { patch: '', report: { files: [], primary: { added: [], already_there: [] }, languages: {}, catalogs_seen: sent }, deferred: [] });
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'localize') {
     const text = JSON.stringify({
       patch: ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', "-export const Hello = () => <p>Hello</p>;", "+export const Hello = () => <p>{t('Hello')}</p>;", ''].join('\n'),
@@ -114,7 +123,7 @@ function handle(req, body) {
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
   if (key === 'POST /mcp/admin') {
-    const text = JSON.stringify({ project: 'shop', primary_language: 'en', languages: ['fr'], i18n: { framework: 'react', library: 'react-i18next', function: 't', catalog_folder: 'lang' }, refused_strings: [] });
+    const text = JSON.stringify({ project: 'shop', primary_language: 'en', languages: ['fr'], i18n: { framework: 'react', library: 'react-i18next', function: 't', catalog_folder: 'lang', js_catalog_folder: state.jsCatalogFolder || null }, refused_strings: [] });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
   return [404, { message: 'no route ' + key }];
@@ -478,6 +487,26 @@ test('localize --all sends every tracked source file the server selects, committ
   const loc = calls.find((c) => c.path === '/mcp/admin' && c.body.params.name === 'localize');
   assert.deepEqual(loc.body.params.arguments.files.map((f) => f.path), ['resources/js/Hello.tsx', 'resources/js/app.ts']);
   assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+});
+
+test('localize sends both catalog folders, read again before every batch', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  fs.mkdirSync(path.join(repo, 'resources', 'js', 'locales'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'locales', 'en.json'), '{}\n');
+  fs.mkdirSync(path.join(repo, 'lang'));
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), '{}\n');
+  g(repo, 'add', '.');
+  g(repo, 'commit', '-q', '-m', 'files');
+  reset({ jsCatalogFolder: 'resources/js/locales', localizeTwoBatches: true });
+  const r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const locs = calls.filter((c) => c.path === '/mcp/admin' && c.body.params.name === 'localize');
+  assert.equal(locs.length, 2);
+  assert.deepEqual(locs[0].body.params.arguments.catalogs.map((c) => c.path), ['lang/en.json', 'resources/js/locales/en.json']);
+  assert.deepEqual(locs[1].body.params.arguments.catalogs.map((c) => c.path), ['lang/en.json', 'lang/fr.json', 'resources/js/locales/en.json']);
+  assert.equal(fs.readFileSync(path.join(repo, 'lang', 'fr.json'), 'utf8'), '{\n    "Hello": "Bonjour"\n}\n');
 });
 
 test('init treats --languages as targets: a new project keeps English as its source unless --primary says otherwise', async () => {
