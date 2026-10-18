@@ -65,12 +65,14 @@ Configuration: `LYNGO_HOST` (default `https://lyngo.app`), `LYNGO_TOKEN`
 
 ## The Claude Code plugin (optional)
 
-This repository is also a Claude Code plugin. It adds the `/lyngo:localize`
-command and the `lyngo-i18n` skill, which makes the agent check existing keys
-before it writes new text. It needs the `lyngo` command from npm.
+This repository is also a Claude Code plugin. It adds the commands
+`/lyngo:init`, `/lyngo:localize`, `/lyngo:status` and `/lyngo:login`, and the
+`lyngo-i18n` skill, which makes the agent check existing keys before it writes
+new text. It needs the `lyngo` command from npm; `lyngo init` prints these two
+lines when the plugin is not installed yet.
 
 ```bash
-claude plugin marketplace add <owner>/lyngo-claude-plugin
+claude plugin marketplace add prettifystudio/lyngo-claude-plugin
 claude plugin install lyngo@lyngo
 ```
 

@@ -259,6 +259,7 @@ test('init on a found project sets everything up, and a second run changes nothi
   assert.match(r.stdout, /Scaffolding applied:\n {2}package\.json\n {2}resources\/js\/i18n\.ts/);
   assert.match(r.stdout, /Run npm install/);
   assert.match(r.stdout, /Done\. Build as usual; lyngo localize runs when your agent finishes, or run it yourself before committing\./);
+  assert.match(r.stdout, /Slash commands for Claude Code \(\/lyngo:localize, \/lyngo:init, \/lyngo:status\): claude plugin marketplace add prettifystudio\/lyngo-claude-plugin && claude plugin install lyngo@lyngo/);
   assert.ok(!r.out.includes(TOKEN), 'the token never reaches the terminal');
 
   // Every call inside the repository names it.

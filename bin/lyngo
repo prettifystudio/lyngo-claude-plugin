@@ -367,6 +367,11 @@ function setUpClaudeCode(top, remote) {
     }
   }
   console.log(`Claude Code: the lyngo MCP server is registered for this repository, and the Stop hook ${has ? 'was already' : 'is'} in .claude/settings.local.json.`);
+  // The slash commands (/lyngo:localize, /lyngo:init, /lyngo:status) come
+  // from the plugin; say how to get it when it is not installed yet.
+  let installed = false;
+  try { installed = /\blyngo\b/.test(run(['plugin', 'list'])); } catch { /* no plugin support, or none installed */ }
+  if (!installed) console.log('Slash commands for Claude Code (/lyngo:localize, /lyngo:init, /lyngo:status): claude plugin marketplace add prettifystudio/lyngo-claude-plugin && claude plugin install lyngo@lyngo');
 }
 
 async function init(opts) {
