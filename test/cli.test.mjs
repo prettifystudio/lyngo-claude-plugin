@@ -9,6 +9,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+const HOOK = 'if command -v lyngo >/dev/null 2>&1; then lyngo localize 2>&1 | tail -20; else echo "lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"; fi';
 const BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'lyngo');
 const TOKEN = 'lyn_' + 'Z'.repeat(40);
 const REMOTE = 'git@github.com:acme/shop.git';
@@ -280,7 +281,7 @@ test('init on a found project sets everything up, and a second run changes nothi
   assert.deepEqual(claudeCalls[1], ['mcp', 'add', '--transport', 'http', '--scope', 'local', 'lyngo', base + '/mcp', '-H', 'Authorization: Bearer ' + TOKEN, '-H', 'X-Lyngo-Remote: ' + REMOTE]);
   assert.ok(!fs.existsSync(path.join(repo, '.mcp.json')), 'never a .mcp.json');
   const settings = JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8'));
-  assert.deepEqual(settings.hooks.Stop, [{ hooks: [{ type: 'command', command: 'lyngo localize 2>&1 | tail -20' }] }]);
+  assert.deepEqual(settings.hooks.Stop, [{ hooks: [{ type: 'command', command: HOOK }] }]);
   const exclude = fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8');
   assert.equal(exclude.split('\n').filter((l) => l === '.claude/settings.local.json').length, 1);
   assert.equal(g(repo, 'status', '--porcelain', '--', '.claude'), '');
@@ -311,7 +312,37 @@ test('init keeps an existing settings file and adds the hook beside it', async (
   const settings = JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8'));
   assert.deepEqual(settings.permissions, { allow: ['Bash(ls)'] });
   assert.equal(settings.hooks.Stop.length, 2);
-  assert.equal(settings.hooks.Stop[1].hooks[0].command, 'lyngo localize 2>&1 | tail -20');
+  assert.equal(settings.hooks.Stop[1].hooks[0].command, HOOK);
+});
+
+test('init writes the hook and registers the MCP server before the language question, so a run that stops there still leaves them', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude();
+  reset({ languages: [], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.notEqual(r.code, 0, 'no languages, no TTY: init stops at the question');
+  assert.match(r.out, /choose the languages with --languages/);
+  const settings = JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8'));
+  assert.deepEqual(settings.hooks.Stop, [{ hooks: [{ type: 'command', command: HOOK }] }]);
+  const claudeCalls = fs.readFileSync(claude.log, 'utf8').split('---\n').filter(Boolean).map((b) => b.trim().split('\n'));
+  assert.equal(claudeCalls[1][1], 'add');
+  assert.equal(calls.filter((c) => c.method === 'PATCH').length, 0);
+});
+
+test('init upgrades the old Stop hook to the one that says when the CLI is missing', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude();
+  fs.mkdirSync(path.join(repo, '.claude'));
+  fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'lyngo localize 2>&1 | tail -20' }] }] } }));
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.equal(r.code, 0, r.out);
+  const settings = JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8'));
+  assert.deepEqual(settings.hooks.Stop, [{ hooks: [{ type: 'command', command: HOOK }] }]);
+  const sh = execFileSync('/bin/sh', ['-c', HOOK], { encoding: 'utf8', env: { PATH: '/nonexistent' } });
+  assert.match(sh, /lyngo: the CLI is not on PATH\. Install it: npm i -g @prettifystudio\/lyngo-cli/);
 });
 
 test('init does not warn when the branch is pushed and package.json is clean', async () => {

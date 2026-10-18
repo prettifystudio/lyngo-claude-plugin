@@ -28,7 +28,10 @@ const TOKEN_DIR = path.join(os.homedir(), '.config', 'lyngo');
 const TOKEN_FILE = path.join(TOKEN_DIR, 'token');
 // Milliseconds per protocol second. Tests shrink it; people never set it.
 const TICK = Number(process.env.LYNGO_TICK_MS) > 0 ? Number(process.env.LYNGO_TICK_MS) : 1000;
-const HOOK_COMMAND = 'lyngo localize 2>&1 | tail -20';
+// The Stop hook says so when the CLI is not on PATH, instead of a "command not
+// found" that scrolls past unread (corp1 setup, 2026-10-18).
+const HOOK_COMMAND = 'if command -v lyngo >/dev/null 2>&1; then lyngo localize 2>&1 | tail -20; else echo "lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"; fi';
+const OLD_HOOK_COMMANDS = ['lyngo localize 2>&1 | tail -20'];
 const SRC = /\.(blade\.php|php|tsx|jsx|ts|js|vue|svelte)$/;
 const SKIP = /(^|\/)(vendor|node_modules|tests?|database|storage|bootstrap|public|config|\.git)\//;
 
@@ -340,9 +343,15 @@ function setUpClaudeCode(top, remote) {
   settings.hooks = settings.hooks || {};
   const stop = Array.isArray(settings.hooks.Stop) ? settings.hooks.Stop : [];
   const has = stop.some((group) => (group.hooks || []).some((h) => typeof h.command === 'string' && /\blyngo\b[^|]*\blocalize\b/.test(h.command)));
+  let upgraded = false;
+  for (const group of stop) for (const h of group.hooks || []) {
+    if (OLD_HOOK_COMMANDS.includes(h.command)) { h.command = HOOK_COMMAND; upgraded = true; }
+  }
   if (!has) {
     stop.push({ hooks: [{ type: 'command', command: HOOK_COMMAND }] });
     settings.hooks.Stop = stop;
+  }
+  if (!has || upgraded) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
   }
@@ -384,9 +393,11 @@ async function init(opts) {
   console.log(`Detected: ${detected.summary || 'no i18n setup found'}`);
   if (detected.i18n) project = { ...project, i18n: detected.i18n };
 
+  // The agent setup comes before the language question: a run that stops
+  // there still leaves the hook and the MCP server in place (corp1, 2026-10-18).
+  setUpClaudeCode(top, remote);
   project = await chooseLanguages(project, opts);
   await scaffold(project);
-  setUpClaudeCode(top, remote);
   await fillMissingCatalogs(project, opts);
   console.log('Done. Build as usual; lyngo localize runs when your agent finishes, or run it yourself before committing.');
 }
