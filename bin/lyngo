@@ -8,7 +8,7 @@
 //   lyngo whoami                                  who the token belongs to
 //   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github]
 //                                                 connect this repository: project, scaffolding, languages, agent hook
-//   lyngo localize [--languages fr,de] [--no-translate] [--dry]
+//   lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry]
 //                                                 localize (+ translate) the working tree's changes
 //   lyngo check <file>                            the user-facing strings of one file
 //   lyngo status                                  the project as Lyngo knows it
@@ -626,6 +626,18 @@ function changedFiles(top) {
   return [...out].sort();
 }
 
+// Every tracked source file of the repository, as the scan would pick them:
+// a quick local cut by extension and folder, then the server's own rules.
+async function allSourceFiles(top) {
+  const tracked = git(['ls-files', '-z']).split('\0').filter(Boolean).filter((p) => SRC.test(p) && !SKIP.test(p) && fs.existsSync(path.join(top, p)));
+  if (tracked.length === 0) return [];
+  try {
+    const r = await call('select_files', { paths: tracked });
+    if (Array.isArray(r.paths)) return r.paths.filter((p) => tracked.includes(p));
+  } catch { /* an older server without the tool: the local cut stands */ }
+  return tracked;
+}
+
 async function localize(opts) {
   const top = root();
   process.chdir(top);
@@ -637,10 +649,17 @@ async function localize(opts) {
     const p = path.join(folder, code + '.json');
     if (fs.existsSync(p)) catalogs.push({ path: p, content: fs.readFileSync(p, 'utf8') });
   }
-  let files = changedFiles(top);
-  if (files.length === 0) { console.log('lyngo: nothing changed in the working tree.'); return null; }
+  // --all: the whole repository, not the changed files. The server picks the
+  // paths a scan would process out of the tracked tree (its own rules, so
+  // the two never drift); the batches of 30 below do the rest (2026-10-18).
+  let files = opts.all ? await allSourceFiles(top) : changedFiles(top);
+  if (files.length === 0) { console.log(opts.all ? 'lyngo: no source file of this project found in the repository.' : 'lyngo: nothing changed in the working tree.'); return null; }
+  const total = files.length;
+  if (opts.all) console.log(`lyngo: localizing ${total} file${total === 1 ? '' : 's'} in batches of 30 (${Math.ceil(total / 30)} call${total > 30 ? 's' : ''}); each batch applies before the next.`);
   const report = { files: [], added: [], reused: [], languages: {} };
+  let batch = 0;
   while (files.length) {
+    batch++;
     const payload = files.map((p) => ({ path: p, content: fs.readFileSync(p, 'utf8') }));
     const args = { files: payload, catalogs: catalogs.map((c) => ({ path: c.path, content: fs.existsSync(c.path) ? fs.readFileSync(c.path, 'utf8') : c.content })), format: 'patch' };
     if (opts.languages) args.languages = opts.languages.filter((l) => l !== status.primary_language);
@@ -666,6 +685,11 @@ async function localize(opts) {
       report.languages[code] = cur;
     }
     files = r.deferred || [];
+    if (opts.all) {
+      const done = total - files.length;
+      const got = (r.report?.files || []).reduce((n, f) => n + (f.wrapped?.length || 0), 0);
+      console.log(`  batch ${batch}: ${done}/${total} files, ${got} string${got === 1 ? '' : 's'} localized`);
+    }
   }
   const wrapped = report.files.reduce((n, f) => n + f.wrapped.length, 0);
   console.log(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.`);
@@ -710,9 +734,10 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
                                     (--languages are the target languages; the source stays en unless --primary)
   lyngo onboard --run=<id> [--languages fr,de]
                                     the guided setup an agent follows, from lyngo.app/start; run it again to continue
-  lyngo localize [--languages fr,de] [--no-translate] [--dry]
+  lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry]
                                     localize what changed in the working tree, and translate it
                                     (--no-translate: keys only; the project setting "Translate when localizing" is the default)
+                                    (--all: the whole repository instead of the changed files, in batches of 30)
   lyngo translate <code> [<code>…]  fill every key a language's catalog lacks, from the primary catalog
   lyngo check <file>                the user-facing strings of one file
   lyngo status                      the project as Lyngo knows it

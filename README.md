@@ -45,6 +45,9 @@ already set up.
 - With an agent: build as usual. The hook runs `lyngo localize` at the end of
   every task.
 - Without an agent: run `lyngo localize` before you commit.
+- A repository that was never localized: `lyngo localize --all` once. It walks
+  every source file a scan would read, in batches, and leaves the result in
+  your working tree to review and commit. No pull request.
 - Anything pushed without it still gets a pull request from the Lyngo GitHub
   App.
 
@@ -56,7 +59,7 @@ already set up.
 | `lyngo logout` | Revokes the token and deletes it from this machine |
 | `lyngo whoami` | The account, the token prefix and your workspaces |
 | `lyngo init` | Connects the repository (see above). Flags: `--languages`, `--workspace`, `--yes`, `--github` |
-| `lyngo localize` | Localizes and translates what changed in the working tree. Flags: `--languages`, `--dry` |
+| `lyngo localize` | Localizes and translates what changed in the working tree. Flags: `--all` (the whole repository, in batches of 30), `--languages`, `--no-translate`, `--dry` |
 | `lyngo check <file>` | The user-facing strings of one file |
 | `lyngo status` | The project as Lyngo knows it |
 

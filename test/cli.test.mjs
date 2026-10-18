@@ -99,6 +99,10 @@ function handle(req, body) {
     });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
+  if (key === 'POST /mcp/admin' && body.params.name === 'select_files') {
+    const paths = body.params.arguments.paths.filter((p) => !p.endsWith('.d.ts'));
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ paths, count: paths.length, of: body.params.arguments.paths.length }) }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'translate') {
     // Fills every requested key with "[code] key"; keeps what the caller sent.
     const a = body.params.arguments;
@@ -453,6 +457,27 @@ test('localize sends the changed files to the admin MCP endpoint and applies the
   assert.deepEqual(loc.body.params.arguments.files.map((f) => f.path), ['resources/js/Hello.tsx']);
   assert.equal(loc.body.params.arguments.format, 'patch');
   assert.equal(loc.headers['x-lyngo-remote'], REMOTE);
+});
+
+test('localize --all sends every tracked source file the server selects, committed or not, in batches', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'types.d.ts'), 'export {};\n');
+  fs.mkdirSync(path.join(repo, 'vendor', 'x'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'vendor', 'x', 'a.php'), '<?php\n');
+  g(repo, 'add', '.');
+  g(repo, 'commit', '-q', '-m', 'files');
+  const r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /localizing 2 files in batches of 30 \(1 call\)/);
+  assert.match(r.stdout, /batch 1: 2\/2 files, 1 string localized/);
+  assert.match(r.stdout, /1 string localized in 1 file; 1 new key, 0 reused\./);
+  const sel = calls.find((c) => c.path === '/mcp/admin' && c.body.params.name === 'select_files');
+  assert.deepEqual(sel.body.params.arguments.paths, ['resources/js/Hello.tsx', 'resources/js/app.ts', 'resources/js/types.d.ts']);
+  const loc = calls.find((c) => c.path === '/mcp/admin' && c.body.params.name === 'localize');
+  assert.deepEqual(loc.body.params.arguments.files.map((f) => f.path), ['resources/js/Hello.tsx', 'resources/js/app.ts']);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
 });
 
 test('init treats --languages as targets: a new project keeps English as its source unless --primary says otherwise', async () => {

@@ -2,7 +2,7 @@
 	"$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
 	"name": "lyngo",
 	"displayName": "Lyngo",
-	"version": "0.2.2",
+	"version": "0.2.3",
 	"description": "Localization for Laravel applications, from the terminal: Lyngo wraps user-facing text with your framework's i18n call, reuses your project's keys, translates and verifies the catalogs. Blade, Livewire, PHP, and Inertia with React, Vue or Svelte.",
 	"author": {
 		"name": "Prettify Studio",
