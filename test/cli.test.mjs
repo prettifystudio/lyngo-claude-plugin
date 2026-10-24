@@ -393,6 +393,22 @@ test('init waits for the GitHub App when the owner connects it, then creates the
   assert.equal(calls.filter((c) => c.path === '/cli/projects').length, 2);
 });
 
+test('init without a terminal stops at the missing GitHub App with the link and the steps, instead of waiting', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  reset({
+    projectsSeq: [[409, { status: 'needs_github_app', owner: true, repository: 'acme/shop', connect_url: 'https://github.com/apps/lyngo/installations/new?state=abc', message: 'The Lyngo GitHub App cannot read acme/shop yet.' }]],
+    statusSeq: [[200, { github_connected: false, project: null }]],
+  });
+  const r = await run(['init', '--languages', 'en,fr'], { cwd: repo });
+  assert.equal(r.code, 3, r.out);
+  assert.match(r.stdout, /The Lyngo GitHub App cannot read acme\/shop yet\.\n {2}https:\/\/github\.com\/apps\/lyngo\/installations\/new\?state=abc/);
+  assert.match(r.stdout, /WAITING FOR THE PERSON: open the link above, add the repository to the Lyngo GitHub App, then run lyngo init again\./);
+  assert.doesNotMatch(r.stdout, /Waiting for GitHub/);
+  assert.equal(calls.filter((c) => c.path === '/cli/projects/status').length, 0);
+  assert.equal(calls.filter((c) => c.path === '/cli/projects').length, 1);
+});
+
 test('init stops a member when GitHub is not connected', async () => {
   loggedIn();
   const repo = makeRepo();

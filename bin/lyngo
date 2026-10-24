@@ -6,7 +6,7 @@
 //   lyngo login                                   sign in once; the token goes to ~/.config/lyngo/token
 //   lyngo logout                                  revoke the token and delete the file
 //   lyngo whoami                                  who the token belongs to
-//   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github]
+//   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait]
 //                                                 connect this repository: project, scaffolding, languages, agent hook
 //   lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry]
 //                                                 localize (+ translate) the working tree's changes
@@ -228,6 +228,14 @@ async function connectProject(opts, remote, branch) {
       console.log(messageOf(r.data, r.status));
       if (r.data.connect_url) console.log('  ' + r.data.connect_url);
       if (!r.data.owner) { process.exitCode = 1; return null; }
+      // No person at a terminal (an agent, a script): waiting would only get
+      // the command killed by the caller's timeout. Say what to do and stop;
+      // the next run picks up where this one ended (corp2, 2026-10-24).
+      if (!process.stdin.isTTY && !opts.github && !opts.wait) {
+        console.log('WAITING FOR THE PERSON: open the link above, add the repository to the Lyngo GitHub App, then run lyngo init again.');
+        process.exitCode = 3;
+        return null;
+      }
       if (opts.github || await confirm('Open it now?', opts)) openUrl(r.data.connect_url);
       console.log('Waiting for GitHub (up to 10 minutes)...');
       const q = new URLSearchParams({ remote, ...(opts.workspace ? { workspace: opts.workspace } : {}) });
@@ -735,7 +743,7 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
   lyngo login                       sign in once (opens the browser)
   lyngo logout                      revoke the token and delete it from this machine
   lyngo whoami                      who the token belongs to
-  lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github]
+  lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait]
                                     connect this repository: project, i18n setup, languages, agent hook
                                     (--languages are the target languages; the source stays en unless --primary)
   lyngo onboard --run=<id> [--languages fr,de]

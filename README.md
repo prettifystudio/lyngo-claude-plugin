@@ -26,8 +26,10 @@ lyngo init           # project, i18n setup, languages, agent hook
 
 1. Shows the workspace it uses. `--workspace <name>` picks another one.
 2. Finds the Lyngo project for the repository's `origin` remote, or creates it
-   when you own the workspace. When GitHub is not connected yet, it prints the
-   link to connect it and waits.
+   when you own the workspace. When the Lyngo GitHub App cannot read the
+   repository yet, it prints the GitHub link where you add it; in a terminal it
+   waits until you have, in an agent or a script it stops, and the next run
+   continues (`--wait` makes it wait anyway).
 3. Detects the framework and the i18n library.
 4. Sets the languages: `--languages fr,de`, or it asks.
 5. Applies the i18n setup as a patch to your working tree. It edits
