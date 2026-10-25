@@ -119,6 +119,9 @@ function handle(req, body) {
     const paths = body.params.arguments.paths.filter((p) => !p.endsWith('.d.ts'));
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ paths, count: paths.length, of: body.params.arguments.paths.length }) }] } }];
   }
+  if (key === 'POST /mcp/admin' && body.params.name === 'check') {
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify(state.check) }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'translate') {
     // Fills every requested key with "[code] key"; keeps what the caller sent.
     const a = body.params.arguments;
@@ -497,6 +500,29 @@ test('status goes to the admin MCP endpoint with the token and the remote', asyn
   assert.equal(c.headers.authorization, 'Bearer ' + TOKEN);
   assert.equal(c.headers['x-lyngo-remote'], REMOTE);
   assert.equal(c.body.params.name, 'status');
+});
+
+test('check prints the strings of one file: the text, path keys on a path-key project, the note when nothing changes', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const file = 'resources/js/Hello.tsx';
+  fs.writeFileSync(path.join(repo, file), 'export const Hello = () => <p>Hello</p>;\n');
+  const answer = (over) => ({ file, project: 'shop', key_style: 'text', user_facing_strings: ['Hello', 'Sign in'], keys: { Hello: 'Hello', 'Sign in': 'Sign in' }, count: 2, changed: true, rewritten: 'x', existing_keys: [], note: 'Write "rewritten" back to the file.', ...over });
+
+  state.check = answer();
+  let r = await run(['check', file], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout, `${file}: 2 user-facing strings\n  "Hello"\n  "Sign in"\n`);
+  const c = calls.find((x) => x.path === '/mcp/admin');
+  assert.deepEqual(c.body.params, { name: 'check', arguments: { path: file, content: 'export const Hello = () => <p>Hello</p>;\n' } });
+
+  state.check = answer({ key_style: 'path', keys: { 'hello.title': 'Hello', 'hello.sign_in': 'Sign in' } });
+  r = await run(['check', file], { cwd: repo });
+  assert.equal(r.stdout, `${file}: 2 user-facing strings\n  hello.title => "Hello"\n  hello.sign_in => "Sign in"\n`);
+
+  state.check = answer({ user_facing_strings: [], keys: [], count: 0, changed: false, rewritten: null, note: 'Nothing to localize.' });
+  r = await run(['check', file], { cwd: repo });
+  assert.equal(r.stdout, `${file}: 0 user-facing strings\nNothing to localize.\n`);
 });
 
 test('localize sends the changed files to the admin MCP endpoint and applies the patch', async () => {
