@@ -4,12 +4,14 @@ import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const HOOK = 'if command -v lyngo >/dev/null 2>&1; then lyngo localize 2>&1 | tail -20; else echo "lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"; fi';
+const HOOK = `if command -v lyngo >/dev/null 2>&1; then lyngo localize --hook; else echo '{"systemMessage":"Lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"}'; fi`;
+const HOOK_024 = 'if command -v lyngo >/dev/null 2>&1; then lyngo localize 2>&1 | tail -20; else echo "lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"; fi';
 const BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'lyngo');
 const TOKEN = 'lyn_' + 'Z'.repeat(40);
 const REMOTE = 'git@github.com:acme/shop.git';
@@ -91,6 +93,11 @@ function handle(req, body) {
     return [200, { project: project({ languages: body.languages, primary_language: body.primary_language }) }];
   }
   if (key === 'POST /cli/projects/p1/scaffold') return state.scaffold(body);
+  if (key === 'POST /mcp/admin' && state.mcpFail) return state.mcpFail;
+  if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeNothing) {
+    const text = JSON.stringify({ patch: '', report: { files: body.params.arguments.files.map((f) => ({ path: f.path, wrapped: [] })), primary: { added: [], already_there: [] }, languages: { fr: { translated: 0, from_memory: 0, flagged: [] } } }, deferred: [] });
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeTwoBatches) {
     // First call: a catalog is created and one file is deferred. Second call: that catalog must come back.
     const sent = body.params.arguments.catalogs.map((c) => c.path);
@@ -103,7 +110,7 @@ function handle(req, body) {
   if (key === 'POST /mcp/admin' && body.params.name === 'localize') {
     const text = JSON.stringify({
       patch: ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', "-export const Hello = () => <p>Hello</p>;", "+export const Hello = () => <p>{t('Hello')}</p>;", ''].join('\n'),
-      report: { files: [{ path: 'resources/js/Hello.tsx', wrapped: ['Hello'] }], primary: { added: ['Hello'], already_there: [] }, languages: { fr: { translated: 1, from_memory: 0, flagged: [] } } },
+      report: { files: [{ path: 'resources/js/Hello.tsx', wrapped: ['Hello'] }], primary: { added: ['Hello'], already_there: [] }, languages: { fr: { translated: 1, from_memory: 0, flagged: [] } }, dot_keys: ['auth.missing'] },
       deferred: [],
     });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
@@ -171,12 +178,13 @@ function safePath(extra = []) {
   return [...new Set(dirs)].join(path.delimiter);
 }
 
-function run(args, { cwd = scratch, pathDirs = [] } = {}) {
+function run(args, { cwd = scratch, pathDirs = [], input } = {}) {
   const env = { ...process.env, HOME: home(), LYNGO_HOST: base, LYNGO_NO_BROWSER: '1', LYNGO_TICK_MS: '1', PATH: safePath(pathDirs), GIT_TERMINAL_PROMPT: '0' };
   delete env.LYNGO_TOKEN;
   delete env.LYNGO_URL;
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [BIN, ...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [BIN, ...args], { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    if (input !== undefined) child.stdin.end(input);
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (c) => { stdout += c; });
@@ -355,8 +363,30 @@ test('init upgrades the old Stop hook to the one that says when the CLI is missi
   assert.equal(r.code, 0, r.out);
   const settings = JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8'));
   assert.deepEqual(settings.hooks.Stop, [{ hooks: [{ type: 'command', command: HOOK }] }]);
-  const sh = execFileSync('/bin/sh', ['-c', HOOK], { encoding: 'utf8', env: { PATH: '/nonexistent' } });
-  assert.match(sh, /lyngo: the CLI is not on PATH\. Install it: npm i -g @prettifystudio\/lyngo-cli/);
+});
+
+test('init upgrades the 0.2.4 Stop hook in place to the --hook one', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude();
+  fs.mkdirSync(path.join(repo, '.claude'));
+  fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: HOOK_024 }] }] } }));
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.equal(r.code, 0, r.out);
+  const settings = JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8'));
+  assert.deepEqual(settings.hooks.Stop, [{ hooks: [{ type: 'command', command: HOOK }] }]);
+});
+
+test('the hook command prints valid JSON when the CLI is not on PATH, and passes stdin through when it is', () => {
+  const missing = execFileSync('/bin/sh', ['-c', HOOK], { cwd: scratch, encoding: 'utf8', env: { PATH: '' } });
+  assert.deepEqual(JSON.parse(missing), { systemMessage: 'Lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli' });
+  // A stand-in lyngo that echoes its stdin: nothing between Claude Code and the CLI eats the input.
+  const dir = path.join(scratch, 'fake-lyngo');
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'lyngo'), '#!/bin/sh\ncat\n', { mode: 0o755 });
+  const through = execFileSync('/bin/sh', ['-c', HOOK], { cwd: scratch, encoding: 'utf8', input: '{"stop_hook_active":false}', env: { PATH: dir + ':/usr/bin:/bin' } });
+  assert.equal(through, '{"stop_hook_active":false}');
 });
 
 test('init does not warn when the branch is pushed and package.json is clean', async () => {
@@ -654,4 +684,116 @@ test('onboard refuses a folder that is not a Laravel repository', async () => {
   assert.equal(r.code, 1);
   assert.match(r.out, /not a Laravel application/);
   assert.deepEqual(state.runSteps.map((x) => [x.step, x.state]), [['cli', 'failed']]);
+});
+
+// ── lyngo localize --hook ─────────────────────────────────────────────────
+
+const STOP = '{"session_id":"s1","hook_event_name":"Stop","stop_hook_active":false}';
+const sha1 = (file) => createHash('sha1').update(fs.readFileSync(file)).digest('hex');
+const hookState = (repo) => path.join(repo, '.git', 'lyngo-hook.json');
+const mcpCalls = () => calls.filter((c) => c.path === '/mcp/admin');
+function helloRepo() {
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  return repo;
+}
+
+test('localize --hook prints one JSON object: a line for the person, the report for the agent; the files are patched and the state is written', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout.trim().split('\n').length, 1, 'one line on stdout');
+  const out = JSON.parse(r.stdout);
+  assert.deepEqual(Object.keys(out).sort(), ['hookSpecificOutput', 'systemMessage']);
+  assert.equal(out.systemMessage, 'Lyngo: 1 string localized in 1 file, 1 new key; fr: 1 translated');
+  assert.equal(out.hookSpecificOutput.hookEventName, 'Stop');
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert.match(ctx, /^lyngo: 1 string localized in 1 file; 1 new key, 0 reused\.\n {2}resources\/js\/Hello\.tsx: "Hello"\n {2}fr: 1 translated, 0 from memory\n/);
+  assert.match(ctx, /\n {2}path keys no catalog holds: "auth\.missing"\n/);
+  assert.match(ctx, /already updated these files and the catalogs on disk\. Tell the user in one or two sentences what Lyngo changed\. Do not edit those files or the catalogs again\./);
+  const file = path.join(repo, 'resources', 'js', 'Hello.tsx');
+  assert.equal(fs.readFileSync(file, 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+  assert.deepEqual(JSON.parse(fs.readFileSync(hookState(repo), 'utf8')), { 'resources/js/Hello.tsx': sha1(file) });
+  assert.doesNotMatch(g(repo, 'status', '--porcelain', '--untracked-files=all'), /lyngo-hook/);
+});
+
+test('localize --hook stays silent while Claude is already continuing for a stop hook', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const r = await run(['localize', '--hook'], { cwd: repo, input: '{"stop_hook_active":true}' });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout, '');
+  assert.equal(calls.length, 0);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
+});
+
+test('localize --hook with no changed files prints nothing and calls nobody', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout, '');
+  assert.equal(calls.length, 0);
+});
+
+test('localize --hook sends nothing when nothing changed since its last run, and sends a file again once it is edited', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Other.tsx'), 'export const Other = 1;\n');
+  const first = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(first.code, 0, first.out);
+  assert.deepEqual(mcpCalls().find((c) => c.body.params.name === 'localize').body.params.arguments.files.map((f) => f.path), ['resources/js/Hello.tsx', 'resources/js/Other.tsx']);
+
+  reset();
+  const again = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(again.code, 0, again.out);
+  assert.equal(again.stdout, '');
+  assert.equal(calls.length, 0, 'no status call, no localize call');
+
+  // Plain localize ignores the hook state: it sends every changed file.
+  reset({ localizeNothing: true });
+  const plain = await run(['localize'], { cwd: repo });
+  assert.equal(plain.code, 0, plain.out);
+  assert.equal(mcpCalls().find((c) => c.body.params.name === 'localize').body.params.arguments.files.length, 2);
+
+  reset({ localizeNothing: true });
+  fs.appendFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Bye = () => <p>Bye</p>;\n');
+  const edited = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(edited.code, 0, edited.out);
+  assert.deepEqual(mcpCalls().find((c) => c.body.params.name === 'localize').body.params.arguments.files.map((f) => f.path), ['resources/js/Hello.tsx']);
+  assert.deepEqual(JSON.parse(edited.stdout), { systemMessage: 'Lyngo: checked 1 file, nothing to localize' });
+});
+
+test('localize --hook with nothing to localize prints only the line for the person', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ localizeNothing: true });
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(JSON.parse(r.stdout), { systemMessage: 'Lyngo: checked 1 file, nothing to localize' });
+  assert.ok(fs.existsSync(hookState(repo)), 'a checked file is not sent again');
+});
+
+test('localize --hook turns every failure into one JSON object with the fix, exits 0 and records nothing', async () => {
+  const repo = helloRepo();
+  const cases = [
+    [() => {}, /^Lyngo: not logged in\. Run lyngo login first$/, /Tell the user, with the fix: run \/lyngo:login/],
+    [() => { loggedIn(); reset({ mcpFail: [404, { error: 'no_project', message: 'No Lyngo project for this repository. Run lyngo init.' }] }); }, /^Lyngo: No Lyngo project for this repository\. Run lyngo init$/, /with the fix: run \/lyngo:init/],
+    [() => { reset({ mcpFail: [500, { message: 'Server Error' }] }); }, /^Lyngo: Server Error$/, /with the fix: run \/lyngo:localize to try again\.$/],
+  ];
+  for (const [setup, line, fix] of cases) {
+    setup();
+    const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(r.stdout.trim().split('\n').length, 1);
+    const out = JSON.parse(r.stdout);
+    assert.match(out.systemMessage, line);
+    assert.equal(out.hookSpecificOutput.hookEventName, 'Stop');
+    assert.match(out.hookSpecificOutput.additionalContext, /^Lyngo could not localize the changes: /);
+    assert.match(out.hookSpecificOutput.additionalContext, fix);
+    assert.ok(!r.out.includes(TOKEN));
+    assert.ok(!fs.existsSync(hookState(repo)));
+  }
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
 });

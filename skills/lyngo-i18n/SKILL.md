@@ -27,12 +27,16 @@ translations consistent with everything the project already has.
      invent a key; `lyngo localize` wraps it and adds the key.
 3. **`check`** lists the user-facing strings of one file when you are not sure
    what Lyngo will pick up.
-4. **When the user asks to localize or translate what you changed**, or at the
-   end of a task that added text: run `lyngo localize` from the repository root
-   (if `lyngo` is not on PATH: `node "${CLAUDE_PLUGIN_ROOT}/bin/lyngo" localize`)
-   and show the user its output. It reads the changed files and catalogs itself
-   and applies the patch; never read or write those files yourself for this.
-   The Stop hook that `lyngo init` installed runs it at the end of a task too.
+4. **At the end of a task that added text, do nothing extra** when the Stop
+   hook that `lyngo init` installs is in `.claude/settings.local.json`: it runs
+   `lyngo localize --hook` when your turn ends and hands you its report as
+   "Stop hook feedback". Then tell the user in one or two sentences what Lyngo
+   changed, and do not edit those files or the catalogs again.
+   **When the user asks to localize or translate**, or there is no hook: run
+   `lyngo localize` from the repository root (if `lyngo` is not on PATH:
+   `node "${CLAUDE_PLUGIN_ROOT}/bin/lyngo" localize`) and show the user its
+   output. It reads the changed files and catalogs itself and applies the
+   patch; never read or write those files yourself for this.
 5. Scans, pull requests, the glossary, refusals and the translation editor live
    in the Lyngo web app. When the user asks for one of them, tell them where it
    is; do not try to do it from here.

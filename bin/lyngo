@@ -8,7 +8,7 @@
 //   lyngo whoami                                  who the token belongs to
 //   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait]
 //                                                 connect this repository: project, scaffolding, languages, agent hook
-//   lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry]
+//   lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry] [--hook]
 //                                                 localize (+ translate) the working tree's changes
 //   lyngo check <file>                            the user-facing strings of one file
 //   lyngo status                                  the project as Lyngo knows it
@@ -16,6 +16,7 @@
 // Config: LYNGO_HOST (default https://lyngo.app), LYNGO_URL (MCP endpoint,
 // default $LYNGO_HOST/mcp/admin), LYNGO_TOKEN (or ~/.config/lyngo/token).
 'use strict';
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -29,9 +30,13 @@ const TOKEN_FILE = path.join(TOKEN_DIR, 'token');
 // Milliseconds per protocol second. Tests shrink it; people never set it.
 const TICK = Number(process.env.LYNGO_TICK_MS) > 0 ? Number(process.env.LYNGO_TICK_MS) : 1000;
 // The Stop hook says so when the CLI is not on PATH, instead of a "command not
-// found" that scrolls past unread (corp1 setup, 2026-10-18).
-const HOOK_COMMAND = 'if command -v lyngo >/dev/null 2>&1; then lyngo localize 2>&1 | tail -20; else echo "lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"; fi';
-const OLD_HOOK_COMMANDS = ['lyngo localize 2>&1 | tail -20'];
+// found" that scrolls past unread (corp1 setup, 2026-10-18). No pipe: Claude
+// Code's JSON must reach lyngo on stdin, and stdout must stay one JSON object.
+const HOOK_COMMAND = `if command -v lyngo >/dev/null 2>&1; then lyngo localize --hook; else echo '{"systemMessage":"Lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"}'; fi`;
+const OLD_HOOK_COMMANDS = [
+  'lyngo localize 2>&1 | tail -20',
+  'if command -v lyngo >/dev/null 2>&1; then lyngo localize 2>&1 | tail -20; else echo "lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"; fi',
+];
 const SRC = /\.(blade\.php|php|tsx|jsx|ts|js|vue|svelte)$/;
 const SKIP = /(^|\/)(vendor|node_modules|tests?|database|storage|bootstrap|public|config|\.git)\//;
 
@@ -646,9 +651,24 @@ async function allSourceFiles(top) {
   return tracked;
 }
 
+function sha1(p) { try { return crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex'); } catch { return null; } }
+
 async function localize(opts) {
   const top = root();
   process.chdir(top);
+  // In hook mode the report goes to the agent, not the terminal (localizeHook).
+  const lines = [];
+  const say = (line) => (opts.hook ? lines.push(line) : console.log(line));
+  // --all: the whole repository, not the changed files. The server picks the
+  // paths a scan would process out of the tracked tree (its own rules, so
+  // the two never drift); the batches of 30 below do the rest (2026-10-18).
+  let files = opts.all ? await allSourceFiles(top) : changedFiles(top);
+  // The hook runs at every stop: it sends only the files whose content changed
+  // since its last successful run, so a stop without new edits costs nothing.
+  const changed = files;
+  const statePath = opts.hook ? path.resolve(top, git(['rev-parse', '--git-path', 'lyngo-hook.json']).trim()) : null;
+  if (statePath) { const seen = parseCatalog(statePath) || {}; files = files.filter((p) => seen[p] !== sha1(p)); }
+  if (files.length === 0) { say(opts.all ? 'lyngo: no source file of this project found in the repository.' : 'lyngo: nothing changed in the working tree.'); return null; }
   const status = await call('status', {});
   const langs = opts.languages || [status.primary_language, ...(status.languages || [])];
   // Both catalog folders (Laravel's lang and the frontend's own), read again
@@ -663,15 +683,11 @@ async function localize(opts) {
     }
     return out;
   };
-  // --all: the whole repository, not the changed files. The server picks the
-  // paths a scan would process out of the tracked tree (its own rules, so
-  // the two never drift); the batches of 30 below do the rest (2026-10-18).
-  let files = opts.all ? await allSourceFiles(top) : changedFiles(top);
-  if (files.length === 0) { console.log(opts.all ? 'lyngo: no source file of this project found in the repository.' : 'lyngo: nothing changed in the working tree.'); return null; }
   const total = files.length;
-  if (opts.all) console.log(`lyngo: localizing ${total} file${total === 1 ? '' : 's'} in batches of 30 (${Math.ceil(total / 30)} call${total > 30 ? 's' : ''}); each batch applies before the next.`);
-  const report = { files: [], added: [], reused: [], languages: {} };
+  if (opts.all) say(`lyngo: localizing ${total} file${total === 1 ? '' : 's'} in batches of 30 (${Math.ceil(total / 30)} call${total > 30 ? 's' : ''}); each batch applies before the next.`);
+  const report = { files: [], added: [], reused: [], languages: {}, missing: new Set() };
   let batch = 0;
+  let patched = false;
   while (files.length) {
     batch++;
     const payload = files.map((p) => ({ path: p, content: fs.readFileSync(p, 'utf8') }));
@@ -688,9 +704,11 @@ async function localize(opts) {
         try { git(['apply', '--whitespace=nowarn', tmp]); }
         catch (e) { fail('the patch did not apply (' + (e.stderr || '').toString().trim() + '); it is at ' + tmp); }
         fs.unlinkSync(tmp);
+        patched = true;
       }
     }
     for (const f of r.report?.files || []) if (f.wrapped?.length) report.files.push(f);
+    for (const k of r.report?.dot_keys || []) report.missing.add(k);
     report.added.push(...(r.report?.primary?.added || []));
     report.reused.push(...(r.report?.primary?.already_there || []));
     for (const [code, l] of Object.entries(r.report?.languages || {})) {
@@ -702,19 +720,67 @@ async function localize(opts) {
     if (opts.all) {
       const done = total - files.length;
       const got = (r.report?.files || []).reduce((n, f) => n + (f.wrapped?.length || 0), 0);
-      console.log(`  batch ${batch}: ${done}/${total} files, ${got} string${got === 1 ? '' : 's'} localized`);
+      say(`  batch ${batch}: ${done}/${total} files, ${got} string${got === 1 ? '' : 's'} localized`);
     }
   }
+  // Recorded after the patch, so the hook's own changes never count as new edits.
+  if (statePath) fs.writeFileSync(statePath, JSON.stringify(Object.fromEntries(changed.map((p) => [p, sha1(p)]))) + '\n');
   const wrapped = report.files.reduce((n, f) => n + f.wrapped.length, 0);
-  console.log(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.`);
-  for (const f of report.files) console.log(`  ${f.path}: ${f.wrapped.slice(0, 6).map((s) => JSON.stringify(s)).join(', ')}${f.wrapped.length > 6 ? ', …' : ''}`);
-  if (opts['no-translate'] || (status.translate_on_localize === false && !Object.keys(report.languages).length)) console.log('  catalogs: not translated (keys only).');
+  say(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.`);
+  for (const f of report.files) say(`  ${f.path}: ${f.wrapped.slice(0, 6).map((s) => JSON.stringify(s)).join(', ')}${f.wrapped.length > 6 ? ', …' : ''}`);
+  if (opts['no-translate'] || (status.translate_on_localize === false && !Object.keys(report.languages).length)) say('  catalogs: not translated (keys only).');
   for (const [code, l] of Object.entries(report.languages)) {
     const flagged = l.flagged.length ? `; ${l.flagged.length} flagged for review: ${l.flagged.slice(0, 3).map((x) => JSON.stringify(x.key || x)).join(', ')}` : '';
-    console.log(`  ${code}: ${l.translated} translated, ${l.from_memory} from memory${flagged}`);
+    say(`  ${code}: ${l.translated} translated, ${l.from_memory} from memory${flagged}`);
   }
-  if (wrapped === 0 && report.added.length === 0) console.log('  Nothing to change: every string a person reads already goes through an i18n call.');
-  return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length };
+  if (report.missing.size) say(`  path keys no catalog holds: ${[...report.missing].slice(0, 6).map((k) => JSON.stringify(k)).join(', ')}${report.missing.size > 6 ? ', …' : ''}`);
+  if (wrapped === 0 && report.added.length === 0) say('  Nothing to change: every string a person reads already goes through an i18n call.');
+  return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length, byLanguage: report.languages, sent: total, patched, lines };
+}
+
+// ── the Claude Code Stop hook ──────────────────────────────────────────────
+// A Stop hook's plain stdout reaches only Claude Code's debug log. It reads one
+// JSON object instead: systemMessage is a line for the person, and
+// additionalContext wakes the agent with the report. Always exit 0: exit 2 or
+// a "block" decision shows as an error, any other code as a hook error.
+const HOOK_CLIP = 7000; // each field is capped at 10,000 characters, and JSON escaping adds some
+const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+function hookOut(systemMessage, context) {
+  const out = { systemMessage: clip(systemMessage, 500) };
+  if (context) out.hookSpecificOutput = { hookEventName: 'Stop', additionalContext: context };
+  process.stdout.write(JSON.stringify(out) + '\n');
+}
+
+async function localizeHook(opts) {
+  let input = {};
+  if (!process.stdin.isTTY) {
+    let raw = '';
+    try { for await (const chunk of process.stdin) raw += chunk; input = JSON.parse(raw); } catch { /* no input: run as a plain stop */ }
+  }
+  // Claude is already continuing because of a stop hook: a second report would loop.
+  if (input && input.stop_hook_active === true) return;
+  let r;
+  try {
+    r = await localize(opts);
+  } catch (e) {
+    const t = (() => { try { return readToken(false); } catch { return null; } })();
+    const msg = scrub((e && e.message) || String(e), t).replace(/\s+/g, ' ').trim().replace(/\.$/, '');
+    const fix = /\blogin\b/i.test(msg) ? 'run /lyngo:login (or lyngo login in a terminal)'
+      : /lyngo init/i.test(msg) ? 'run /lyngo:init (or lyngo init in a terminal)'
+      : 'run /lyngo:localize to try again';
+    hookOut('Lyngo: ' + msg, `Lyngo could not localize the changes: ${clip(msg, HOOK_CLIP)}. Tell the user, with the fix: ${fix}.`);
+    return;
+  }
+  if (!r) return;
+  const n = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+  if (!r.patched) { hookOut(`Lyngo: checked ${n(r.sent, 'file')}, nothing to localize`); return; }
+  const langs = Object.entries(r.byLanguage)
+    .filter(([, l]) => l.translated || l.from_memory || l.flagged.length)
+    .map(([code, l]) => `${code}: ${l.translated} translated${l.from_memory ? `, ${l.from_memory} from memory` : ''}${l.flagged.length ? `, ${l.flagged.length} flagged for review` : ''}`);
+  hookOut(
+    `Lyngo: ${n(r.wrapped, 'string')} localized in ${n(r.files, 'file')}, ${n(r.added, 'new key')}${r.reused ? `, ${r.reused} reused` : ''}${langs.length ? '; ' + langs.join('; ') : ''}`,
+    clip(r.lines.join('\n'), HOOK_CLIP) + '\n\nLyngo has already updated these files and the catalogs on disk. Tell the user in one or two sentences what Lyngo changed. Do not edit those files or the catalogs again. If the user checks the page, rebuild the frontend first.',
+  );
 }
 
 async function check(file) {
@@ -748,10 +814,11 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
                                     (--languages are the target languages; the source stays en unless --primary)
   lyngo onboard --run=<id> [--languages fr,de]
                                     the guided setup an agent follows, from lyngo.app/start; run it again to continue
-  lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry]
+  lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry] [--hook]
                                     localize what changed in the working tree, and translate it
                                     (--no-translate: keys only; the project setting "Translate when localizing" is the default)
                                     (--all: the whole repository instead of the changed files, in batches of 30)
+                                    (--hook: the Claude Code Stop hook; one JSON object, only files changed since its last run)
   lyngo translate <code> [<code>…]  fill every key a language's catalog lacks, from the primary catalog
   lyngo check <file>                the user-facing strings of one file
   lyngo status                      the project as Lyngo knows it
@@ -791,7 +858,7 @@ function parse(argv) {
       case 'logout': await logout(); break;
       case 'whoami': await whoami(); break;
       case 'init': await init(opts); break;
-      case 'localize': await localize(opts); break;
+      case 'localize': await (opts.hook ? localizeHook(opts) : localize(opts)); break;
       case 'onboard': await onboard(opts); break;
       case 'translate': await translate(opts); break;
       case 'check': await check(opts._[0]); break;

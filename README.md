@@ -37,15 +37,17 @@ lyngo init           # project, i18n setup, languages, agent hook
 6. When Claude Code is installed: registers the Lyngo MCP server for this
    repository in Claude Code's local scope (stored in your home folder, never in
    the repository), and adds one Stop hook to `.claude/settings.local.json` that
-   runs `lyngo localize` when your agent finishes a task.
+   runs `lyngo localize --hook` when your agent finishes a task.
 
 Run it again at any time: it prints the state and changes nothing that is
 already set up.
 
 ## Daily use
 
-- With an agent: build as usual. The hook runs `lyngo localize` at the end of
-  every task.
+- With an agent: build as usual. The hook runs `lyngo localize --hook` at the
+  end of every task. You see one line (what was localized and translated); the
+  agent gets the full report and tells you what changed. It stays silent when
+  nothing changed, and sends a file again only after it is edited.
 - Without an agent: run `lyngo localize` before you commit.
 - A repository that was never localized: `lyngo localize --all` once. It walks
   every source file a scan would read, in batches, and leaves the result in
@@ -61,7 +63,7 @@ already set up.
 | `lyngo logout` | Revokes the token and deletes it from this machine |
 | `lyngo whoami` | The account, the token prefix and your workspaces |
 | `lyngo init` | Connects the repository (see above). Flags: `--languages`, `--workspace`, `--yes`, `--github` |
-| `lyngo localize` | Localizes and translates what changed in the working tree. Flags: `--all` (the whole repository, in batches of 30), `--languages`, `--no-translate`, `--dry` |
+| `lyngo localize` | Localizes and translates what changed in the working tree. Flags: `--all` (the whole repository, in batches of 30), `--languages`, `--no-translate`, `--dry`, `--hook` (the Claude Code Stop hook) |
 | `lyngo check <file>` | The user-facing strings of one file |
 | `lyngo status` | The project as Lyngo knows it |
 

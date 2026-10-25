@@ -1,6 +1,6 @@
 {
   "name": "@prettifystudio/lyngo-cli",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Localization for Laravel applications, from the terminal: Lyngo wraps user-facing text with your framework's i18n call, reuses your project's keys, translates and verifies the catalogs. Blade, Livewire, PHP, and Inertia with React, Vue or Svelte.",
   "bin": {
     "lyngo": "bin/lyngo"
