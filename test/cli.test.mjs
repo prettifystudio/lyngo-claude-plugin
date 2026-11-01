@@ -94,8 +94,30 @@ function handle(req, body) {
   }
   if (key === 'POST /cli/projects/p1/scaffold') return state.scaffold(body);
   if (key === 'POST /mcp/admin' && state.mcpFail) return state.mcpFail;
+  // Jobs (async: true), when the test turns them on: the call answers with an id, and
+  // job_status answers "running" state.jobRunning times, then the payload the call returns without async.
+  if (key === 'POST /mcp/admin' && state.jobs && body.params.arguments?.async === true) {
+    const { async: _async, ...args } = body.params.arguments;
+    const [, sync] = handle(req, { ...body, params: { ...body.params, arguments: args } });
+    const id = 'job-' + (Object.keys(state.jobs).length + 1);
+    state.jobs[id] = { polls: 0, payload: JSON.parse(sync.result.content[0].text) };
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ job: id, status: 'queued' }) }] } }];
+  }
+  if (key === 'POST /mcp/admin' && body.params.name === 'job_status') {
+    const id = body.params.arguments.job;
+    const job = state.jobs[id];
+    job.polls++;
+    const st = state.jobFail ? { status: 'failed', error: state.jobFail } : job.polls <= (state.jobRunning ?? 1) ? { status: 'running' } : { status: 'done', result: job.payload };
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ job: id, ...st }) }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeNothing) {
     const text = JSON.stringify({ patch: '', report: { files: body.params.arguments.files.map((f) => ({ path: f.path, wrapped: [] })), primary: { added: [], already_there: [] }, languages: { fr: { translated: 0, from_memory: 0, flagged: [] } } }, deferred: [] });
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
+  }
+  if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeOneAtATime) {
+    // One file a call, the rest deferred, whatever the client applied: the loop must still end.
+    const [first, ...rest] = body.params.arguments.files;
+    const text = JSON.stringify({ patch: '', report: { files: [{ path: first.path, wrapped: [] }], primary: { added: [], already_there: [] }, languages: {} }, deferred: rest.map((f) => f.path) });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
   if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeTwoBatches) {
@@ -110,8 +132,9 @@ function handle(req, body) {
   if (key === 'POST /mcp/admin' && body.params.name === 'localize') {
     const text = JSON.stringify({
       patch: ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', "-export const Hello = () => <p>Hello</p>;", "+export const Hello = () => <p>{t('Hello')}</p>;", ''].join('\n'),
-      report: { files: [{ path: 'resources/js/Hello.tsx', wrapped: ['Hello'] }], primary: { added: ['Hello'], already_there: [] }, languages: { fr: { translated: 1, from_memory: 0, flagged: [] } }, dot_keys: ['auth.missing'] },
+      report: { files: [{ path: 'resources/js/Hello.tsx', wrapped: ['Hello'] }], primary: { added: ['Hello'], already_there: [] }, languages: { fr: { translated: 1, from_memory: 0, flagged: [] } }, dot_keys: ['auth.missing'], ...(state.localizeReport || {}) },
       deferred: [],
+      next: state.localizeNext || 'Apply the patch with git apply, then show the user the report.',
     });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
@@ -181,8 +204,8 @@ function safePath(extra = []) {
   return [...new Set(dirs)].join(path.delimiter);
 }
 
-function run(args, { cwd = scratch, pathDirs = [], input } = {}) {
-  const env = { ...process.env, HOME: home(), LYNGO_HOST: base, LYNGO_NO_BROWSER: '1', LYNGO_TICK_MS: '1', PATH: safePath(pathDirs), GIT_TERMINAL_PROMPT: '0' };
+function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {} } = {}) {
+  const env = { ...process.env, HOME: home(), LYNGO_HOST: base, LYNGO_NO_BROWSER: '1', LYNGO_TICK_MS: '1', PATH: safePath(pathDirs), GIT_TERMINAL_PROMPT: '0', ...extra };
   delete env.LYNGO_TOKEN;
   delete env.LYNGO_URL;
   return new Promise((resolve) => {
@@ -551,7 +574,7 @@ test('localize --all sends every tracked source file the server selects, committ
   g(repo, 'commit', '-q', '-m', 'files');
   const r = await run(['localize', '--all'], { cwd: repo });
   assert.equal(r.code, 0, r.out);
-  assert.match(r.stdout, /localizing 2 files in batches of 30 \(1 call\)/);
+  assert.match(r.stdout, /localizing 2 files in batches; each batch applies before the next\./);
   assert.match(r.stdout, /batch 1: 2\/2 files, 1 string localized/);
   assert.match(r.stdout, /1 string localized in 1 file; 1 new key, 0 reused\./);
   const sel = calls.find((c) => c.path === '/mcp/admin' && c.body.params.name === 'select_files');
@@ -822,4 +845,110 @@ test('localize --hook turns every failure into one JSON object with the fix, exi
     assert.ok(!fs.existsSync(hookState(repo)));
   }
   assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
+});
+
+// ── 0.2.7: localize and translate run as server jobs ──────────────────────
+
+test('localize starts a job, polls job_status until it is done, applies the result and shows progress', async () => {
+  loggedIn();
+  reset({ jobs: {}, jobRunning: 7 });
+  const repo = helloRepo();
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const loc = mcpCalls().find((c) => c.body.params.name === 'localize');
+  assert.equal(loc.body.params.arguments.async, true);
+  const polls = mcpCalls().filter((c) => c.body.params.name === 'job_status');
+  assert.equal(polls.length, 8);
+  assert.ok(polls.every((c) => c.body.params.arguments.job === 'job-1'));
+  assert.match(r.stdout, /Lyngo is still working \(running, 15 s\)/);
+  assert.match(r.stdout, /1 string localized in 1 file; 1 new key, 0 reused\./);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+});
+
+test('localize --hook waits for the job and still prints one JSON object, no progress lines', async () => {
+  loggedIn();
+  reset({ jobs: {}, jobRunning: 7 });
+  const repo = helloRepo();
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout.trim().split('\n').length, 1, 'one line on stdout');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.systemMessage, 'Lyngo: 1 string localized in 1 file, 1 new key; fr: 1 translated');
+  assert.doesNotMatch(out.hookSpecificOutput.additionalContext, /still working/);
+});
+
+test('a failed job stops localize with the server\'s message and changes nothing', async () => {
+  loggedIn();
+  reset({ jobs: {}, jobFail: 'Lyngo could not finish this job on the server. Run the command again; if it fails again, send us the job id job-1.' });
+  const repo = helloRepo();
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /lyngo: Lyngo could not finish this job on the server\. Run the command again; if it fails again, send us the job id job-1\./);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
+});
+
+test('a job that never finishes gives up after the timeout with a clear message', async () => {
+  loggedIn();
+  reset({ jobs: {}, jobRunning: 1e9 });
+  const r = await run(['localize'], { cwd: helloRepo(), env: { LYNGO_JOB_TIMEOUT: '60' } });
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /the server did not finish within 1 minutes \(job job-1\)\. Run the command again later\./);
+});
+
+test('localize sends Laravel\'s lang/<code>/*.php files with the catalogs', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  fs.mkdirSync(path.join(repo, 'lang', 'en'), { recursive: true });
+  fs.mkdirSync(path.join(repo, 'lang', 'fr'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), '{}\n');
+  fs.writeFileSync(path.join(repo, 'lang', 'en', 'orders.php'), "<?php\n\nreturn ['title' => 'Orders'];\n");
+  fs.writeFileSync(path.join(repo, 'lang', 'en', 'auth.php'), "<?php\n\nreturn [];\n");
+  fs.writeFileSync(path.join(repo, 'lang', 'fr', 'orders.php'), "<?php\n\nreturn ['title' => 'Commandes'];\n");
+  fs.writeFileSync(path.join(repo, 'lang', 'fr', 'notes.txt'), 'not a lang file\n');
+  reset({ jobs: {} });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const loc = mcpCalls().find((c) => c.body.params.name === 'localize');
+  assert.deepEqual(loc.body.params.arguments.catalogs.map((c) => c.path), ['lang/en.json', 'lang/en/auth.php', 'lang/en/orders.php', 'lang/fr/orders.php']);
+  assert.equal(loc.body.params.arguments.catalogs.find((c) => c.path === 'lang/fr/orders.php').content, "<?php\n\nreturn ['title' => 'Commandes'];\n");
+});
+
+test('localize prints what the server skipped, the keys a language did not get and its notes', async () => {
+  loggedIn();
+  reset({
+    jobs: {},
+    localizeReport: { skipped: [{ path: 'resources/js/Data.tsx', reason: 'too large for one call: split it, or let a scan localize it' }], languages: { fr: { translated: 1, from_memory: 0, flagged: [], untranslated: ['Goodbye', 'Thanks'] } } },
+    localizeNext: 'Apply the patch with git apply, then show the user the report. Some translations did not fit in this call: run `lyngo translate fr`.',
+  });
+  const r = await run(['localize'], { cwd: helloRepo() });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /fr: 2 keys not translated yet \("Goodbye", "Thanks"\): run lyngo translate fr/);
+  assert.match(r.stdout, /skipped resources\/js\/Data\.tsx: too large for one call: split it, or let a scan localize it/);
+  assert.match(r.stdout, /\n {2}Some translations did not fit in this call: run `lyngo translate fr`\.\n/);
+  assert.doesNotMatch(r.stdout, /Apply the patch/);
+});
+
+test('localize --dry with jobs ends: each call sends only what the last one deferred', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  for (const name of ['A', 'B', 'C']) fs.writeFileSync(path.join(repo, 'resources', 'js', name + '.tsx'), `export const ${name} = () => <p>${name}</p>;\n`);
+  reset({ jobs: {}, localizeOneAtATime: true });
+  const r = await run(['localize', '--dry'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const locs = mcpCalls().filter((c) => c.body.params.name === 'localize');
+  assert.deepEqual(locs.map((c) => c.body.params.arguments.files.length), [3, 2, 1]);
+});
+
+test('translate runs each chunk as a job and writes the catalog', async () => {
+  loggedIn();
+  reset({ jobs: {}, jobRunning: 2 });
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), JSON.stringify({ Hello: 'Hello', Save: 'Save' }, null, 2) + '\n');
+  const r = await run(['translate', 'fr'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /fr: 2 translated, 0 from memory -> lang\/fr\.json/);
+  assert.equal(mcpCalls().find((c) => c.body.params.name === 'translate').body.params.arguments.async, true);
+  assert.equal(mcpCalls().filter((c) => c.body.params.name === 'job_status').length, 3);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(repo, 'lang', 'fr.json'), 'utf8')).Save, '[fr] Save');
 });

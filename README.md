@@ -9,7 +9,9 @@ When you or your agent add text a person reads, `lyngo localize` wraps it with
 your project's i18n calls, reuses the keys you already have, and translates the
 catalogs with your glossary, translation memory and plural rules, before you
 commit. The files come back to your working tree as one patch. A model never
-holds them.
+holds them. The work runs as a job on the server: the CLI starts it, checks on
+it every few seconds and applies the result, so a large change set takes as
+long as it needs instead of hitting a time limit.
 
 ## Install
 
@@ -63,12 +65,14 @@ already set up.
 | `lyngo logout` | Revokes the token and deletes it from this machine |
 | `lyngo whoami` | The account, the token prefix and your workspaces |
 | `lyngo init` | Connects the repository (see above). Flags: `--languages`, `--workspace`, `--yes`, `--github` |
-| `lyngo localize` | Localizes and translates what changed in the working tree. Flags: `--all` (the whole repository, in batches of 30), `--languages`, `--no-translate`, `--dry`, `--hook` (the Claude Code Stop hook) |
+| `lyngo localize` | Localizes and translates what changed in the working tree, as server jobs of up to 100 files. It sends the catalogs and Laravel's `lang/<code>/*.php` with the files, and prints what the server skipped or left untranslated. Flags: `--all` (the whole repository, in batches), `--languages`, `--no-translate`, `--dry`, `--hook` (the Claude Code Stop hook) |
+| `lyngo translate <code>…` | Fills every key a language's catalog lacks, from the primary catalog, as server jobs of 100 keys |
 | `lyngo check <file>` | The user-facing strings of one file |
 | `lyngo status` | The project as Lyngo knows it |
 
 Configuration: `LYNGO_HOST` (default `https://lyngo.app`), `LYNGO_TOKEN`
-(otherwise `~/.config/lyngo/token`). Revoke tokens in Lyngo under Settings, CLI.
+(otherwise `~/.config/lyngo/token`), `LYNGO_JOB_TIMEOUT` (seconds to wait for
+one job, default 3900). Revoke tokens in Lyngo under Settings, CLI.
 
 ## The Claude Code plugin (optional)
 

@@ -14,7 +14,8 @@
 //   lyngo status                                  the project as Lyngo knows it
 //
 // Config: LYNGO_HOST (default https://lyngo.app), LYNGO_URL (MCP endpoint,
-// default $LYNGO_HOST/mcp/admin), LYNGO_TOKEN (or ~/.config/lyngo/token).
+// default $LYNGO_HOST/mcp/admin), LYNGO_TOKEN (or ~/.config/lyngo/token),
+// LYNGO_JOB_TIMEOUT (seconds to wait for one localize or translate job, default 3900).
 'use strict';
 const crypto = require('crypto');
 const fs = require('fs');
@@ -127,6 +128,28 @@ async function call(name, args) {
   const text = body.result?.content?.[0]?.text ?? '';
   if (body.result?.isError) fail(text);
   try { return JSON.parse(text); } catch { fail('unexpected answer: ' + text.slice(0, 200)); }
+}
+
+// localize and translate run as a job on the server (async: true): the call
+// answers at once with its id, and job_status hands back the payload the call
+// used to return. A proxy cut the long calls at 100 s (HTTP 524, 2026-10-31).
+// A server without jobs answers with the payload itself.
+const POLL_SECONDS = 2.5;
+const JOB_TIMEOUT_SECONDS = Number(process.env.LYNGO_JOB_TIMEOUT) > 0 ? Number(process.env.LYNGO_JOB_TIMEOUT) : 65 * 60;
+async function callJob(name, args, progress) {
+  const first = await call(name, { ...args, async: true });
+  if (!first || typeof first.job !== 'string') return first;
+  let waited = 0;
+  let told = 0;
+  for (;;) {
+    await sleep(POLL_SECONDS);
+    waited += POLL_SECONDS;
+    const s = await call('job_status', { job: first.job });
+    if (s.status === 'done') return s.result || {};
+    if (s.status === 'failed') fail(s.error || `the job ${first.job} failed on the server.`);
+    if (waited >= JOB_TIMEOUT_SECONDS) fail(`the server did not finish within ${Math.round(JOB_TIMEOUT_SECONDS / 60)} minutes (job ${first.job}). Run the command again later.`);
+    if (progress && waited - told >= 15) { told = waited; progress(`  ... Lyngo is still working (${s.status}, ${Math.round(waited)} s)`); }
+  }
 }
 
 // ── terminal helpers ───────────────────────────────────────────────────────
@@ -468,9 +491,9 @@ async function translateLanguage(code, project) {
   const missing = Object.keys(source).filter((k) => !(k in current) || String(current[k]).trim() === '');
   if (!missing.length) { console.log(`${code}: complete, ${Object.keys(source).length} keys.`); return; }
   let translated = 0, memory = 0, flagged = [];
-  // Chunks keep each request under the server's time; the returned catalog carries forward.
+  // Each chunk is one job on the server; the returned catalog carries forward.
   for (let i = 0; i < missing.length; i += 100) {
-    const r = await call('translate', {
+    const r = await callJob('translate', {
       keys: missing.slice(i, i + 100),
       languages: [code],
       catalogs: [{ path: primaryPath, content: readIfFile(primaryPath) }, { path: targetPath, content: readIfFile(targetPath) || '{}' }],
@@ -661,7 +684,7 @@ async function localize(opts) {
   const say = (line) => (opts.hook ? lines.push(line) : console.log(line));
   // --all: the whole repository, not the changed files. The server picks the
   // paths a scan would process out of the tracked tree (its own rules, so
-  // the two never drift); the batches of 30 below do the rest (2026-10-18).
+  // the two never drift); the server's batches do the rest (2026-10-18).
   let files = opts.all ? await allSourceFiles(top) : changedFiles(top);
   // The hook runs at every stop: it sends only the files whose content changed
   // since its last successful run, so a stop without new edits costs nothing.
@@ -675,17 +698,29 @@ async function localize(opts) {
   // before EVERY call: a catalog the previous batch created must go back, or
   // the server diffs it as new twice (corp1, 2026-10-18: "already exists").
   const folders = [...new Set([status.i18n?.catalog_folder || 'lang', status.i18n?.js_catalog_folder].filter(Boolean).map((f) => f.replace(/\/+$/, '')))];
+  // Laravel's own lang/<code>/*.php go too: the server builds the PHP keys on
+  // them and diffs against them, or a second run writes them again as new
+  // files and the patch fails with "already exists".
+  const phpFolder = (status.i18n?.catalog_folder || 'lang').replace(/\/+$/, '');
   const catalogsNow = () => {
     const out = [];
     for (const folder of folders) for (const code of langs) {
       const p = path.join(folder, code + '.json');
       if (fs.existsSync(p)) out.push({ path: p, content: fs.readFileSync(p, 'utf8') });
     }
+    for (const code of langs) {
+      const dir = path.join(phpFolder, code);
+      let names = [];
+      try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.php')).sort(); } catch { /* no PHP lang files for this language */ }
+      for (const n of names) { const c = readIfFile(path.join(dir, n)); if (c !== null) out.push({ path: path.join(dir, n), content: c }); }
+    }
     return out;
   };
   const total = files.length;
-  if (opts.all) say(`lyngo: localizing ${total} file${total === 1 ? '' : 's'} in batches of 30 (${Math.ceil(total / 30)} call${total > 30 ? 's' : ''}); each batch applies before the next.`);
-  const report = { files: [], added: [], reused: [], languages: {}, missing: new Set() };
+  if (opts.all) say(`lyngo: localizing ${total} file${total === 1 ? '' : 's'} in batches; each batch applies before the next.`);
+  // Progress while a job runs goes to the terminal; the hook keeps its output to the report.
+  const progress = opts.hook ? null : (line) => console.log(line);
+  const report = { files: [], added: [], reused: [], languages: {}, missing: new Set(), skipped: [], untranslated: {}, notes: [] };
   let batch = 0;
   let patched = false;
   while (files.length) {
@@ -695,7 +730,7 @@ async function localize(opts) {
     if (opts.languages) args.languages = opts.languages.filter((l) => l !== status.primary_language);
     // --no-translate: keys only, catalogs for translators. Without the flag the project's setting decides.
     if (opts['no-translate']) args.translate = false;
-    const r = await call('localize', args);
+    const r = await callJob('localize', args, progress);
     if (r.patch && r.patch.trim()) {
       if (opts.dry) { process.stdout.write(r.patch); }
       else {
@@ -715,7 +750,12 @@ async function localize(opts) {
       const cur = report.languages[code] || { translated: 0, from_memory: 0, flagged: [] };
       cur.translated += l.translated || 0; cur.from_memory += l.from_memory || 0; cur.flagged.push(...(l.flagged || []));
       report.languages[code] = cur;
+      if (l.untranslated?.length) (report.untranslated[code] = report.untranslated[code] || []).push(...l.untranslated);
     }
+    report.skipped.push(...(r.report?.skipped || []));
+    // What the server says beyond the steps this CLI takes itself (apply, call again).
+    const note = String(r.next || '').replace(/Apply the patch, then call again with the files in "deferred"\.|Apply the patch with git apply, then show the user the report\./g, '').trim();
+    if (note && !report.notes.includes(note)) report.notes.push(note);
     files = r.deferred || [];
     if (opts.all) {
       const done = total - files.length;
@@ -734,6 +774,9 @@ async function localize(opts) {
     say(`  ${code}: ${l.translated} translated, ${l.from_memory} from memory${flagged}`);
   }
   if (report.missing.size) say(`  path keys no catalog holds: ${[...report.missing].slice(0, 6).map((k) => JSON.stringify(k)).join(', ')}${report.missing.size > 6 ? ', …' : ''}`);
+  for (const [code, keys] of Object.entries(report.untranslated)) say(`  ${code}: ${keys.length} key${keys.length === 1 ? '' : 's'} not translated yet (${keys.slice(0, 3).map((k) => JSON.stringify(k)).join(', ')}${keys.length > 3 ? ', …' : ''}): run lyngo translate ${code}`);
+  for (const sk of report.skipped) say(`  skipped ${sk.path}: ${sk.reason}`);
+  for (const note of report.notes) say(`  ${note}`);
   if (wrapped === 0 && report.added.length === 0) say('  Nothing to change: every string a person reads already goes through an i18n call.');
   return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length, byLanguage: report.languages, sent: total, patched, lines };
 }
