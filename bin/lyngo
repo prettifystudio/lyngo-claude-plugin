@@ -88,19 +88,41 @@ function scrub(text, t) { return t ? String(text).split(t).join(prefixOf(t)) : S
 
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
+// One dropped connection must not end a long run: localize --all on 1554 files
+// died at call 34 of 52 on an ECONNRESET that never reached the server
+// (2026-11-06). A network error or a proxy error before the origin answered is
+// tried again after 2, 5 and 10 s. Every other status keeps its own handling.
+const RETRY_WAITS = [2, 5, 10];
+const RETRY_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT']);
+const RETRY_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
+let quiet = false; // the Stop hook prints one JSON object and nothing else (localizeHook)
+
 async function request(method, url, { body, auth = true, accept = 'application/json' } = {}) {
   const headers = { Accept: accept };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (auth) headers.Authorization = 'Bearer ' + readToken();
   const remote = repoRemote();
   if (remote) headers['X-Lyngo-Remote'] = remote;
-  let res;
-  try {
-    res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-  } catch (e) {
-    fail(`could not reach ${HOST} (${e.cause?.code || e.message}).`);
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  let res, text;
+  for (let attempt = 1; ; attempt++) {
+    let problem;
+    try {
+      res = await fetch(url, { method, headers, body: payload });
+      text = await res.text();
+      if (!RETRY_STATUSES.has(res.status)) break;
+      problem = 'HTTP ' + res.status;
+    } catch (e) {
+      const code = e.cause?.code;
+      const network = RETRY_CODES.has(code) || (!code && e.message === 'fetch failed');
+      if (!network || attempt > RETRY_WAITS.length) fail(`could not reach ${HOST} (${code || e.message}).`);
+      problem = code || e.message;
+    }
+    if (attempt > RETRY_WAITS.length) break;
+    const wait = RETRY_WAITS[attempt - 1];
+    if (!quiet) console.error(`lyngo: connection problem (${problem}), trying again in ${wait} s (${attempt}/${RETRY_WAITS.length + 1}).`);
+    await sleep(wait);
   }
-  const text = await res.text();
   let data = {};
   if (text) {
     try { data = JSON.parse(text); } catch {
@@ -817,6 +839,7 @@ function hookOut(systemMessage, context) {
 }
 
 async function localizeHook(opts) {
+  quiet = true;
   let input = {};
   if (!process.stdin.isTTY) {
     let raw = '';

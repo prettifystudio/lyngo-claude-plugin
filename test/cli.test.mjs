@@ -169,6 +169,10 @@ before(async () => {
     req.on('end', () => {
       const body = raw ? JSON.parse(raw) : null;
       calls.push({ method: req.method, path: new URL(req.url, 'http://x').pathname, url: req.url, headers: req.headers, body });
+      // state.faults: one entry per request ('reset' drops the connection, a number is that status), the last one repeats.
+      const fault = state.faults && next(state.faults);
+      if (fault === 'reset') { req.socket.resetAndDestroy(); return; }
+      if (fault) { res.writeHead(fault, { 'Content-Type': 'text/html' }); res.end(`<html>error ${fault}</html>`); return; }
       const [status, payload] = handle(req, body);
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(payload === null ? '' : JSON.stringify(payload));
@@ -1022,4 +1026,61 @@ test('translate runs each chunk as a job and writes the catalog', async () => {
   assert.equal(mcpCalls().find((c) => c.body.params.name === 'translate').body.params.arguments.async, true);
   assert.equal(mcpCalls().filter((c) => c.body.params.name === 'job_status').length, 3);
   assert.equal(JSON.parse(fs.readFileSync(path.join(repo, 'lang', 'fr.json'), 'utf8')).Save, '[fr] Save');
+});
+
+// ── 0.2.8: a dropped connection is tried again ─────────────────────────────
+
+const RETRY_LINE = /lyngo: connection problem \([^)]+\), trying again in \d+ s \(\d\/4\)\./g;
+
+test('a dropped connection is tried again: the command succeeds and says so in one line', async () => {
+  loggedIn();
+  reset({ faults: ['reset', null] });
+  const r = await run(['status'], { cwd: makeRepo() });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /shop: react \/ react-i18next \/ t\(\), catalogs in lang/);
+  assert.equal(r.stderr, 'lyngo: connection problem (ECONNRESET), trying again in 2 s (1/4).\n');
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].body, calls[0].body, 'the same body goes again');
+});
+
+test('a proxy error before the origin answered (524) is tried again', async () => {
+  loggedIn();
+  reset({ faults: [524, 524, null] });
+  const r = await run(['status'], { cwd: makeRepo() });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /shop: react/);
+  assert.equal(r.stderr.match(RETRY_LINE).length, 2);
+  assert.match(r.stderr, /connection problem \(HTTP 524\), trying again in 5 s \(2\/4\)\./);
+  assert.equal(calls.length, 3);
+});
+
+test('a connection that keeps dropping stops after 4 attempts with the could-not-reach message', async () => {
+  loggedIn();
+  reset({ faults: ['reset'] });
+  const r = await run(['status'], { cwd: makeRepo() });
+  assert.equal(r.code, 1);
+  assert.equal(calls.length, 4);
+  assert.equal(r.stderr.match(RETRY_LINE).length, 3);
+  assert.match(r.stderr, /trying again in 10 s \(3\/4\)\.\nlyngo: could not reach http:\/\/127\.0\.0\.1:\d+ \(ECONNRESET\)\.\n$/);
+});
+
+test('a 400 or a 404 is never tried again', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  for (const status of [400, 404]) {
+    reset({ faults: [status] });
+    const r = await run(['status'], { cwd: repo });
+    assert.equal(r.code, 1);
+    assert.equal(calls.length, 1);
+    assert.doesNotMatch(r.stderr, /trying again/);
+  }
+});
+
+test('localize --hook tries again without a word on the terminal', async () => {
+  loggedIn();
+  reset({ faults: ['reset', null] });
+  const r = await run(['localize', '--hook'], { cwd: helloRepo(), input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stderr, '');
+  assert.equal(JSON.parse(r.stdout).systemMessage, 'Lyngo: 1 string localized in 1 file, 1 new key; fr: 1 translated');
 });
