@@ -6,7 +6,7 @@
 //   lyngo login                                   sign in once; the token goes to ~/.config/lyngo/token
 //   lyngo logout                                  revoke the token and delete the file
 //   lyngo whoami                                  who the token belongs to
-//   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait]
+//   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait] [--no-install]
 //                                                 connect this repository: project, scaffolding, languages, agent hook
 //   lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry] [--hook]
 //                                                 localize (+ translate) the working tree's changes
@@ -314,7 +314,28 @@ async function chooseLanguages(project, opts) {
 
 function readIfFile(p) { try { return fs.statSync(p).isFile() ? fs.readFileSync(p, 'utf8') : null; } catch { return null; } }
 
-async function scaffold(project) {
+// The package manager install after the setup patch: without it Vite cannot
+// resolve the new imports and the page goes blank (vito, Inertia React). Run as a
+// program and arguments, never a shell string, and only a known manager.
+const INSTALLERS = new Set(['npm', 'pnpm', 'yarn', 'bun']);
+function install(command, opts) {
+  const [program, ...args] = command.trim().split(/\s+/);
+  if (opts['no-install'] || opts.hook || !INSTALLERS.has(program)) { console.log(`Run ${command}`); return; }
+  const bin = findOnPath(program);
+  const hint = `Run ${command} in ${process.cwd()} before you start the dev server.`;
+  if (!bin) { console.error(`lyngo: ${program} is not installed, so the new packages are not. ${hint}`); process.exitCode = 1; return; }
+  console.log(`Running ${command}`);
+  try {
+    execFileSync(bin, args, { stdio: 'inherit' });
+  } catch (e) {
+    console.error(`lyngo: ${command} failed (${e.status != null ? 'exit ' + e.status : e.code || e.message}). ${hint}`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log('Restart your dev server so Vite picks up the new packages.');
+}
+
+async function scaffold(project, opts = {}) {
   const tree = (gitTry(['ls-files', '-z', '--cached', '--others', '--exclude-standard']) || '').split('\0').filter(Boolean);
   const sent = new Map();
   for (const p of ['package.json', 'composer.json']) { const c = readIfFile(p); if (c !== null) sent.set(p, c); }
@@ -345,7 +366,7 @@ async function scaffold(project) {
     console.log('Scaffolding applied:');
     for (const f of d.files || []) console.log('  ' + f);
     for (const n of d.notes || []) console.log('  ' + n);
-    if (d.install_command) console.log(`Run ${d.install_command}`);
+    if (d.install_command) install(d.install_command, opts);
     return;
   }
   fail('the server kept asking for more files. Run lyngo init again.');
@@ -438,7 +459,7 @@ async function init(opts) {
   // there still leaves the hook and the MCP server in place (corp1, 2026-10-18).
   setUpClaudeCode(top, remote);
   project = await chooseLanguages(project, opts);
-  await scaffold(project);
+  await scaffold(project, opts);
   await fillMissingCatalogs(project, opts);
   console.log('Done. Build as usual; lyngo localize runs when your agent finishes, or run it yourself before committing.');
 }
@@ -627,7 +648,7 @@ async function onboard(opts) {
 
   // 5. Setup as a patch, 6. the hook, missing catalogs.
   step(5, 'Applying the i18n setup');
-  await scaffold(project);
+  await scaffold(project, opts);
   await report('setup', 'done', detected.summary || 'ready');
   step(6, 'Wiring the agent');
   setUpClaudeCode(top, remote);
@@ -857,9 +878,10 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
   lyngo login                       sign in once (opens the browser)
   lyngo logout                      revoke the token and delete it from this machine
   lyngo whoami                      who the token belongs to
-  lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait]
+  lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait] [--no-install]
                                     connect this repository: project, i18n setup, languages, agent hook
                                     (--languages are the target languages; the source stays en unless --primary)
+                                    (--no-install: print the package install command instead of running it)
   lyngo onboard --run=<id> [--languages fr,de]
                                     the guided setup an agent follows, from lyngo.app/start; run it again to continue
   lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry] [--hook]

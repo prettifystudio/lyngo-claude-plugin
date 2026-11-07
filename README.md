@@ -34,8 +34,11 @@ lyngo init           # project, i18n setup, languages, agent hook
    continues (`--wait` makes it wait anyway).
 3. Detects the framework and the i18n library.
 4. Sets the languages: `--languages fr,de`, or it asks.
-5. Applies the i18n setup as a patch to your working tree. It edits
-   `package.json` but never runs `npm install`; it prints the command.
+5. Applies the i18n setup as a patch to your working tree. When the patch
+   edits `package.json`, it runs your package manager's install (npm, pnpm,
+   yarn or bun, read from the lockfile) so the lockfile and `node_modules`
+   follow. Restart your dev server afterwards. `--no-install` prints the
+   command instead of running it.
 6. When Claude Code is installed: registers the Lyngo MCP server for this
    repository in Claude Code's local scope (stored in your home folder, never in
    the repository), and adds one Stop hook to `.claude/settings.local.json` that
@@ -64,7 +67,7 @@ already set up.
 | `lyngo login` | Signs in through the browser and saves the token (mode 600) |
 | `lyngo logout` | Revokes the token and deletes it from this machine |
 | `lyngo whoami` | The account, the token prefix and your workspaces |
-| `lyngo init` | Connects the repository (see above). Flags: `--languages`, `--workspace`, `--yes`, `--github` |
+| `lyngo init` | Connects the repository (see above). Flags: `--languages`, `--workspace`, `--yes`, `--github`, `--no-install` |
 | `lyngo localize` | Localizes and translates what changed in the working tree, as server jobs of up to 100 files. It sends the catalogs and Laravel's `lang/<code>/*.php` with the files, and prints what the server skipped or left untranslated. Flags: `--all` (the whole repository, in batches), `--languages`, `--no-translate`, `--dry`, `--hook` (the Claude Code Stop hook) |
 | `lyngo translate <code>…` | Fills every key a language's catalog lacks, from the primary catalog, as server jobs of 100 keys |
 | `lyngo check <file>` | The user-facing strings of one file |

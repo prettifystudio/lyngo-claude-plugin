@@ -198,6 +198,19 @@ function stubClaude() {
   return { dir, log };
 }
 
+// Fake package managers, first on every test PATH after the test's own stubs:
+// init runs the install the scaffold names, and a test never runs a real one.
+// Each logs its arguments, its folder and the package.json it saw, then exits with `code`.
+function fakeInstallers(code = 0) {
+  const dir = path.join(scratch, code ? 'pm-fail' : 'pm');
+  const log = path.join(scratch, 'install.log');
+  fs.mkdirSync(dir, { recursive: true });
+  for (const name of ['npm', 'pnpm', 'yarn', 'bun']) {
+    fs.writeFileSync(path.join(dir, name), `#!/bin/sh\nprintf '%s %s in %s\\n' "${name}" "$*" "$(pwd -P)" >> "${log}"\ncat package.json >> "${log}"\necho "${name}: installed"\nexit ${code}\n`, { mode: 0o755 });
+  }
+  return { dir, log };
+}
+
 function safePath(extra = []) {
   const dirs = [...extra, path.dirname(process.execPath), path.dirname(execFileSync('which', ['git'], { encoding: 'utf8' }).trim()), '/usr/bin', '/bin'];
   for (const d of dirs.slice(extra.length)) assert.ok(!fs.existsSync(path.join(d, 'claude')), `a real claude sits in ${d}; the test PATH must not reach it`);
@@ -205,7 +218,7 @@ function safePath(extra = []) {
 }
 
 function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {} } = {}) {
-  const env = { ...process.env, HOME: home(), LYNGO_HOST: base, LYNGO_NO_BROWSER: '1', LYNGO_TICK_MS: '1', PATH: safePath(pathDirs), GIT_TERMINAL_PROMPT: '0', ...extra };
+  const env = { ...process.env, HOME: home(), LYNGO_HOST: base, LYNGO_NO_BROWSER: '1', LYNGO_TICK_MS: '1', PATH: safePath([...pathDirs, fakeInstallers().dir]), GIT_TERMINAL_PROMPT: '0', ...extra };
   delete env.LYNGO_TOKEN;
   delete env.LYNGO_URL;
   return new Promise((resolve) => {
@@ -304,7 +317,7 @@ test('init on a found project sets everything up, and a second run changes nothi
   assert.match(r.stdout, /Detected: react, react-i18next, catalogs in lang/);
   assert.match(r.stdout, /Languages: en -> fr/);
   assert.match(r.stdout, /Scaffolding applied:\n {2}package\.json\n {2}resources\/js\/i18n\.ts/);
-  assert.match(r.stdout, /Run npm install/);
+  assert.match(r.stdout, /Restart your dev server so Vite picks up the new packages\./);
   assert.match(r.stdout, /Done\. Build as usual; lyngo localize runs when your agent finishes, or run it yourself before committing\./);
   assert.match(r.stdout, /Slash commands for Claude Code \(\/lyngo:localize, \/lyngo:init, \/lyngo:status\): claude plugin marketplace add prettifystudio\/lyngo-claude-plugin && claude plugin install lyngo@lyngo/);
   assert.ok(!r.out.includes(TOKEN), 'the token never reaches the terminal');
@@ -346,6 +359,64 @@ test('init on a found project sets everything up, and a second run changes nothi
   const settings2 = JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8'));
   assert.equal(settings2.hooks.Stop.length, 1);
   assert.equal(fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8').split('\n').filter((l) => l === '.claude/settings.local.json').length, 1);
+});
+
+const scaffoldWith = (install_command) => () => [200, { patch: SCAFFOLD_PATCH, files: ['package.json', 'resources/js/i18n.ts'], install_command, notes: [] }];
+
+test('init runs the install command the server names in the repository root, after the patch', async () => {
+  loggedIn();
+  reset({ scaffold: scaffoldWith('pnpm install') });
+  const repo = makeRepo();
+  const r = await run(['init', '--yes', '--languages', 'fr'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const log = fs.readFileSync(path.join(scratch, 'install.log'), 'utf8');
+  assert.ok(log.startsWith(`pnpm install in ${fs.realpathSync(repo)}\n`), log);
+  assert.match(log, /"i18next": "\^23\.0\.0"/, 'the install sees the patched package.json');
+  assert.match(r.stdout, /pnpm: installed/, 'the install output reaches the user');
+  assert.match(r.stdout, /Restart your dev server so Vite picks up the new packages\./);
+  assert.doesNotMatch(r.stdout, /Run pnpm install/);
+});
+
+test('init --no-install prints the install command and runs nothing', async () => {
+  loggedIn();
+  reset({ scaffold: scaffoldWith('yarn install') });
+  const repo = makeRepo();
+  const r = await run(['init', '--yes', '--languages', 'fr', '--no-install'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(!fs.existsSync(path.join(scratch, 'install.log')), 'no install ran');
+  assert.match(r.stdout, /Run yarn install/);
+  assert.match(fs.readFileSync(path.join(repo, 'package.json'), 'utf8'), /"i18next"/, 'the patch still applies');
+});
+
+test('init in --hook mode never runs an install: the command goes to the output', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const r = await run(['init', '--yes', '--languages', 'fr', '--hook'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(!fs.existsSync(path.join(scratch, 'install.log')), 'no install ran');
+  assert.match(r.stdout, /Run npm install/);
+});
+
+test('init exits non-zero with the command to run when the install fails', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const failing = fakeInstallers(1);
+  const r = await run(['init', '--yes', '--languages', 'fr'], { cwd: repo, pathDirs: [failing.dir] });
+  assert.equal(r.code, 1, r.out);
+  assert.ok(fs.existsSync(failing.log), 'the install ran');
+  assert.match(r.stderr, /lyngo: npm install failed \(exit 1\)\. Run npm install in .+ before you start the dev server\./);
+  assert.doesNotMatch(r.stdout, /Restart your dev server/);
+});
+
+test('init exits non-zero with the command to run when the package manager is not installed', async (t) => {
+  const dirs = [path.dirname(execFileSync('which', ['git'], { encoding: 'utf8' }).trim()), '/usr/bin', '/bin'];
+  if (dirs.some((d) => fs.existsSync(path.join(d, 'bun')))) { t.skip('bun is installed next to git'); return; }
+  loggedIn();
+  reset({ scaffold: scaffoldWith('bun install') });
+  const repo = makeRepo();
+  const r = await run(['init', '--yes', '--languages', 'fr'], { cwd: repo, env: { PATH: [...new Set(dirs)].join(path.delimiter) } });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.stderr, /lyngo: bun is not installed, so the new packages are not\. Run bun install in .+ before you start the dev server\./);
 });
 
 test('init keeps an existing settings file and adds the hook beside it', async () => {
