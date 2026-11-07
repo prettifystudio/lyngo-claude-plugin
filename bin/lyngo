@@ -317,10 +317,11 @@ function readIfFile(p) { try { return fs.statSync(p).isFile() ? fs.readFileSync(
 // The package manager install after the setup patch: without it Vite cannot
 // resolve the new imports and the page goes blank (vito, Inertia React). Run as a
 // program and arguments, never a shell string, and only a known manager.
-const INSTALLERS = new Set(['npm', 'pnpm', 'yarn', 'bun']);
+// Only these exact commands run; anything else from the server is printed, never executed.
+const INSTALLERS = new Set(['npm install', 'pnpm install', 'yarn install', 'bun install']);
 function install(command, opts) {
   const [program, ...args] = command.trim().split(/\s+/);
-  if (opts['no-install'] || opts.hook || !INSTALLERS.has(program)) { console.log(`Run ${command}`); return; }
+  if (opts['no-install'] || opts.hook || !INSTALLERS.has([program, ...args].join(' '))) { console.log(`Run ${command}`); return; }
   const bin = findOnPath(program);
   const hint = `Run ${command} in ${process.cwd()} before you start the dev server.`;
   if (!bin) { console.error(`lyngo: ${program} is not installed, so the new packages are not. ${hint}`); process.exitCode = 1; return; }
