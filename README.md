@@ -29,9 +29,11 @@ lyngo init           # project, i18n setup, languages, agent hook
 1. Shows the workspace it uses. `--workspace <name>` picks another one.
 2. Finds the Lyngo project for the repository's `origin` remote, or creates it
    when you own the workspace. When the Lyngo GitHub App cannot read the
-   repository yet, it prints the GitHub link where you add it; in a terminal it
-   waits until you have, in an agent or a script it stops, and the next run
-   continues (`--wait` makes it wait anyway).
+   repository yet, it prints the GitHub link where you add it, opens it in your
+   browser (in a terminal it asks first) and waits until you have added it: up
+   to 10 minutes in a terminal, 9 minutes for an agent or a script. Then it
+   continues by itself. When `CI` is set, or with `--no-wait`, it does not wait:
+   it stops with exit code 3, and the next run continues.
 3. Detects the framework and the i18n library.
 4. Sets the languages: `--languages fr,de`, or it asks.
 5. Applies the i18n setup as a patch to your working tree. When the patch
@@ -67,7 +69,7 @@ already set up.
 | `lyngo login` | Signs in through the browser and saves the token (mode 600) |
 | `lyngo logout` | Revokes the token and deletes it from this machine |
 | `lyngo whoami` | The account, the token prefix and your workspaces |
-| `lyngo init` | Connects the repository (see above). Flags: `--languages`, `--workspace`, `--yes`, `--github`, `--no-install` |
+| `lyngo init` | Connects the repository (see above). Flags: `--languages`, `--workspace`, `--yes`, `--github`, `--no-wait`, `--no-install` |
 | `lyngo localize` | Localizes and translates what changed in the working tree, as server jobs of up to 100 files. It sends the catalogs and Laravel's `lang/<code>/*.php` with the files, and prints what the server skipped or left untranslated. Flags: `--all` (the whole repository, in batches), `--languages`, `--no-translate`, `--dry`, `--hook` (the Claude Code Stop hook) |
 | `lyngo translate <code>…` | Fills every key a language's catalog lacks, from the primary catalog, as server jobs of 100 keys |
 | `lyngo check <file>` | The user-facing strings of one file |

@@ -6,7 +6,7 @@
 //   lyngo login                                   sign in once; the token goes to ~/.config/lyngo/token
 //   lyngo logout                                  revoke the token and delete the file
 //   lyngo whoami                                  who the token belongs to
-//   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait] [--no-install]
+//   lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait] [--no-wait] [--no-install]
 //                                                 connect this repository: project, scaffolding, languages, agent hook
 //   lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry] [--hook]
 //                                                 localize (+ translate) the working tree's changes
@@ -178,6 +178,8 @@ async function callJob(name, args, progress) {
 
 function openUrl(url) {
   if (process.env.LYNGO_NO_BROWSER) return;
+  // The tests name a stand-in opener and wait for it to end; people never set it.
+  if (process.env.LYNGO_OPENER) { try { execFileSync(process.env.LYNGO_OPENER, [url], { stdio: 'ignore' }); } catch { /* the URL is printed */ } return; }
   const [cmd, args] = process.platform === 'darwin' ? ['open', [url]]
     : process.platform === 'win32' ? ['cmd', ['/c', 'start', '""', url]]
     : ['xdg-open', [url]];
@@ -268,6 +270,12 @@ function printProblem(r) {
   if (r.data.billing_url) console.error('  ' + r.data.billing_url);
 }
 
+// A build server sets CI (any value but "false"): nobody there opens a link.
+function inCI() { const v = (process.env.CI || '').trim(); return v !== '' && v.toLowerCase() !== 'false'; }
+// Written with a callback, so the text has reached the OS before the wait
+// starts: an agent that reads the output from a file sees the link at once.
+const printNow = (text) => new Promise((resolve) => process.stdout.write(text + '\n', () => resolve()));
+
 async function connectProject(opts, remote, branch) {
   const body = { remote, branch, workspace: opts.workspace };
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -275,27 +283,34 @@ async function connectProject(opts, remote, branch) {
     const s = r.data.status;
     if ((r.status === 200 || r.status === 201) && r.data.project) return r.data;
     if (s === 'needs_github_app' || r.status === 409) {
-      console.log(messageOf(r.data, r.status));
-      if (r.data.connect_url) console.log('  ' + r.data.connect_url);
+      await printNow(messageOf(r.data, r.status) + (r.data.connect_url ? '\n  ' + r.data.connect_url : ''));
       if (!r.data.owner) { process.exitCode = 1; return null; }
-      // No person at a terminal (an agent, a script): waiting would only get
-      // the command killed by the caller's timeout. Say what to do and stop;
+      // CI or --no-wait: nobody acts on this run. Say what to do and stop;
       // the next run picks up where this one ended (corp2, 2026-10-24).
-      if (!process.stdin.isTTY && !opts.github && !opts.wait) {
+      if (opts['no-wait'] || (inCI() && !opts.wait && !opts.github)) {
         console.log('WAITING FOR THE PERSON: open the link above, add the repository to the Lyngo GitHub App, then run lyngo init again.');
         process.exitCode = 3;
         return null;
       }
-      if (opts.github || await confirm('Open it now?', opts)) openUrl(r.data.connect_url);
-      console.log('Waiting for GitHub (up to 10 minutes)...');
+      // Like npm login: open the link, wait, continue by itself, also for an
+      // agent. Without a terminal the wait ends at 9 minutes, before Claude
+      // Code's 10-minute command limit kills it (2026-11-07).
+      const tty = !!process.stdin.isTTY;
+      if (r.data.connect_url && (!tty || opts.github || await confirm('Open it now?', opts))) openUrl(r.data.connect_url);
+      const minutes = tty ? 10 : 9;
+      await printNow(`Waiting for GitHub (up to ${minutes} minutes)...`);
       const q = new URLSearchParams({ remote, ...(opts.workspace ? { workspace: opts.workspace } : {}) });
+      const start = Date.now();
       let connected = false;
-      for (let waited = 0; waited < 600 && !connected; waited += 5) {
+      let told = 0;
+      while (!connected && Date.now() - start < minutes * 60 * TICK) {
         await sleep(5);
         const st = expect(await api('GET', '/cli/projects/status?' + q), 200);
         connected = !!st.github_connected;
+        const m = Math.floor((Date.now() - start) / (60 * TICK));
+        if (!connected && m > told && m < minutes) { told = m; await printNow(`Still waiting for GitHub (${m} of ${minutes} minutes)...`); }
       }
-      if (!connected) fail('GitHub is still not connected after 10 minutes. Run lyngo init again once it is.');
+      if (!connected) fail(`GitHub is still not connected after ${minutes} minutes. Add the repository to the Lyngo GitHub App, then run lyngo init again.`);
       console.log('GitHub is connected.');
       continue;
     }
@@ -902,9 +917,11 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
   lyngo login                       sign in once (opens the browser)
   lyngo logout                      revoke the token and delete it from this machine
   lyngo whoami                      who the token belongs to
-  lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait] [--no-install]
+  lyngo init [--languages fr,de] [--primary en] [--workspace <name>] [--yes] [--github] [--wait] [--no-wait] [--no-install]
                                     connect this repository: project, i18n setup, languages, agent hook
                                     (--languages are the target languages; the source stays en unless --primary)
+                                    (it waits for the GitHub App: 10 minutes in a terminal, 9 without one)
+                                    (--no-wait: stop with exit code 3 instead of waiting; the default when CI is set)
                                     (--no-install: print the package install command instead of running it)
   lyngo onboard --run=<id> [--languages fr,de]
                                     the guided setup an agent follows, from lyngo.app/start; run it again to continue

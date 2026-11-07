@@ -11,6 +11,15 @@ repository: the `lyngo` MCP server answers questions about the project, and the
 inventing keys or translating by hand: they keep the keys, the wording and the
 translations consistent with everything the project already has.
 
+## When the repository is not connected yet
+
+If you must run `lyngo init` yourself, set the Bash timeout to 600000 ms, or
+run it in the background and read its output. When it prints a GitHub link,
+tell the user that GitHub opened in their browser and that init continues by
+itself once they add the repository. Do not tell them to run init again, unless
+the 9-minute wait ran out. In CI or with `--no-wait`, exit code 3 means a
+person must install the GitHub App first.
+
 ## When
 
 1. **Once per session**, before your first edit to a view or component: call

@@ -225,6 +225,7 @@ function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {} } = {}
   const env = { ...process.env, HOME: home(), LYNGO_HOST: base, LYNGO_NO_BROWSER: '1', LYNGO_TICK_MS: '1', PATH: safePath([...pathDirs, fakeInstallers().dir]), GIT_TERMINAL_PROMPT: '0', ...extra };
   delete env.LYNGO_TOKEN;
   delete env.LYNGO_URL;
+  if (!('CI' in extra)) delete env.CI; // a CI runner sets it; init sees it only where a test says so
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [BIN, ...args], { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
     if (input !== undefined) child.stdin.end(input);
@@ -524,20 +525,85 @@ test('init waits for the GitHub App when the owner connects it, then creates the
   assert.equal(calls.filter((c) => c.path === '/cli/projects').length, 2);
 });
 
-test('init without a terminal stops at the missing GitHub App with the link and the steps, instead of waiting', async () => {
+// ── 0.2.9: init waits for the GitHub App like npm login, also for an agent ──
+
+const APP_URL = 'https://github.com/apps/lyngo/installations/new?state=abc';
+const needsApp = (statusSeq) => reset({
+  projectsSeq: [
+    [409, { status: 'needs_github_app', owner: true, repository: 'acme/shop', connect_url: APP_URL, message: 'The Lyngo GitHub App cannot read acme/shop yet.' }],
+    [201, { status: 'created', project: project(), workspace: { id: 'w1', name: 'Acme' } }],
+  ],
+  statusSeq,
+  scaffold: () => [200, { patch: '', files: [] }],
+});
+// A stand-in browser opener (LYNGO_OPENER): it logs each URL it gets.
+function stubOpener() {
+  const log = path.join(scratch, 'opened.log');
+  const bin = path.join(scratch, 'opener');
+  fs.writeFileSync(bin, `#!/bin/sh\nprintf '%s\\n' "$1" >> "${log}"\n`, { mode: 0o755 });
+  return { env: { LYNGO_NO_BROWSER: '', LYNGO_OPENER: bin }, opened: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean) : []) };
+}
+const LINK = /The Lyngo GitHub App cannot read acme\/shop yet\.\n {2}https:\/\/github\.com\/apps\/lyngo\/installations\/new\?state=abc\n/;
+const STOPPED = /WAITING FOR THE PERSON: open the link above, add the repository to the Lyngo GitHub App, then run lyngo init again\./;
+
+test('init without a terminal prints the link, opens it, waits for the GitHub App and finishes in one run', async () => {
   loggedIn();
   const repo = makeRepo();
-  reset({
-    projectsSeq: [[409, { status: 'needs_github_app', owner: true, repository: 'acme/shop', connect_url: 'https://github.com/apps/lyngo/installations/new?state=abc', message: 'The Lyngo GitHub App cannot read acme/shop yet.' }]],
-    statusSeq: [[200, { github_connected: false, project: null }]],
-  });
-  const r = await run(['init', '--languages', 'en,fr'], { cwd: repo });
+  needsApp([[200, { github_connected: false, project: null }], [200, { github_connected: true, project: null }]]);
+  const opener = stubOpener();
+  const r = await run(['init', '--languages', 'en,fr'], { cwd: repo, env: opener.env });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, LINK);
+  assert.ok(r.stdout.indexOf(APP_URL) < r.stdout.indexOf('Waiting for GitHub (up to 9 minutes)...'), 'the link comes before the wait');
+  assert.match(r.stdout, /GitHub is connected\.\nCreated shop in workspace Acme\./);
+  assert.match(r.stdout, /Done\. Build as usual/);
+  assert.doesNotMatch(r.stdout, /WAITING FOR THE PERSON/);
+  assert.deepEqual(opener.opened(), [APP_URL]);
+  assert.equal(calls.filter((c) => c.path === '/cli/projects/status').length, 2);
+  assert.equal(calls.filter((c) => c.path === '/cli/projects').length, 2);
+});
+
+test('init with CI set stops at the missing GitHub App with exit 3, opens nothing and does not wait', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  needsApp([[200, { github_connected: true, project: null }]]);
+  const opener = stubOpener();
+  const r = await run(['init', '--languages', 'en,fr'], { cwd: repo, env: { ...opener.env, CI: 'true' } });
   assert.equal(r.code, 3, r.out);
-  assert.match(r.stdout, /The Lyngo GitHub App cannot read acme\/shop yet\.\n {2}https:\/\/github\.com\/apps\/lyngo\/installations\/new\?state=abc/);
-  assert.match(r.stdout, /WAITING FOR THE PERSON: open the link above, add the repository to the Lyngo GitHub App, then run lyngo init again\./);
+  assert.match(r.stdout, LINK);
+  assert.match(r.stdout, STOPPED);
   assert.doesNotMatch(r.stdout, /Waiting for GitHub/);
+  assert.deepEqual(opener.opened(), []);
   assert.equal(calls.filter((c) => c.path === '/cli/projects/status').length, 0);
   assert.equal(calls.filter((c) => c.path === '/cli/projects').length, 1);
+});
+
+test('init --no-wait stops at the missing GitHub App with exit 3, opens nothing and does not wait', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  needsApp([[200, { github_connected: true, project: null }]]);
+  const opener = stubOpener();
+  const r = await run(['init', '--languages', 'en,fr', '--no-wait'], { cwd: repo, env: { ...opener.env, CI: 'false' } });
+  assert.equal(r.code, 3, r.out);
+  assert.match(r.stdout, LINK);
+  assert.match(r.stdout, STOPPED);
+  assert.doesNotMatch(r.stdout, /Waiting for GitHub/);
+  assert.deepEqual(opener.opened(), []);
+  assert.equal(calls.filter((c) => c.path === '/cli/projects/status').length, 0);
+});
+
+test('init without a terminal gives up after 9 minutes with a clear message and a line each minute', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  needsApp([[200, { github_connected: false, project: null }]]);
+  const r = await run(['init', '--languages', 'en,fr'], { cwd: repo, env: { LYNGO_TICK_MS: '2' } });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.stderr, /lyngo: GitHub is still not connected after 9 minutes\. Add the repository to the Lyngo GitHub App, then run lyngo init again\./);
+  const progress = r.stdout.match(/Still waiting for GitHub \(\d of 9 minutes\)\.\.\./g) || [];
+  assert.ok(progress.length >= 1 && progress.length <= 8, r.stdout);
+  assert.ok(calls.filter((c) => c.path === '/cli/projects/status').length > 2);
+  assert.equal(calls.filter((c) => c.path === '/cli/projects').length, 1);
+  assert.equal(calls.filter((c) => c.path.endsWith('/detect')).length, 0);
 });
 
 test('init stops a member when GitHub is not connected', async () => {
