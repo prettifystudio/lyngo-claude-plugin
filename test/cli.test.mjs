@@ -142,6 +142,24 @@ function handle(req, body) {
     });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
+  if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeEnumOnly) {
+    // The enum-label pass alone: three files edited (a new enum among them), no string wrapped;
+    // a new catalog with its key when .catalog, "Hello" wrapped when .wrapped, report.enum_labels only when .counts (an older server sends none).
+    const o = state.localizeEnumOnly;
+    const patch = [
+      'diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', '-export const Hello = () => <p>Hello</p>;', '+export const Hello = ({ server }) => <p>{server.status_label ?? server.status}</p>;',
+      'diff --git a/resources/js/app.ts b/resources/js/app.ts', '--- a/resources/js/app.ts', '+++ b/resources/js/app.ts', '@@ -1 +1 @@', "-import './bootstrap';", "+import './bootstrap.js';",
+      'diff --git a/app/Enums/ServerStatus.php b/app/Enums/ServerStatus.php', 'new file mode 100644', '--- /dev/null', '+++ b/app/Enums/ServerStatus.php', '@@ -0,0 +1 @@', '+<?php enum ServerStatus: string {}',
+      ...(o.catalog ? ['diff --git a/lang/en.json b/lang/en.json', 'new file mode 100644', '--- /dev/null', '+++ b/lang/en.json', '@@ -0,0 +1,3 @@', '+{', '+    "Ready": "Ready"', '+}'] : []),
+      '',
+    ].join('\n');
+    const text = JSON.stringify({
+      patch,
+      report: { files: [{ path: 'resources/js/Hello.tsx', wrapped: o.wrapped ? ['Hello'] : [] }], primary: { added: o.catalog ? ['Ready'] : [], already_there: [] }, languages: {}, ...(o.counts ? { enum_labels: { counts: o.counts, left: [] } } : {}) },
+      deferred: [],
+    });
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'localize') {
     const text = JSON.stringify({
       patch: ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', "-export const Hello = () => <p>Hello</p>;", "+export const Hello = () => <p>{t('Hello')}</p>;", ''].join('\n'),
@@ -239,6 +257,7 @@ function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {} } = {}
   delete env.LYNGO_TOKEN;
   delete env.LYNGO_URL;
   if (!('CI' in extra)) delete env.CI; // a CI runner sets it; init sees it only where a test says so
+  if (!('CLAUDE_PROJECT_DIR' in extra)) delete env.CLAUDE_PROJECT_DIR; // set when the suite runs inside Claude Code: the hook would go there
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [BIN, ...args], { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
     if (input !== undefined) child.stdin.end(input);
@@ -912,7 +931,7 @@ test('localize --hook prints one JSON object: a line for the person, the report 
   assert.equal(out.systemMessage, 'Lyngo: 1 string localized in 1 file, 1 new key; fr: 1 translated');
   assert.equal(out.hookSpecificOutput.hookEventName, 'Stop');
   const ctx = out.hookSpecificOutput.additionalContext;
-  assert.match(ctx, /^lyngo: 1 string localized in 1 file; 1 new key, 0 reused\.\n {2}resources\/js\/Hello\.tsx: "Hello"\n {2}fr: 1 translated, 0 from memory\n/);
+  assert.match(ctx, /^lyngo: 1 string localized in 1 file; 1 new key, 0 reused\.\n {2}resources\/js\/Hello\.tsx: "Hello"\n {2}files changed: 1\n {2}fr: 1 translated, 0 from memory\n/);
   assert.match(ctx, /\n {2}path keys no catalog holds: "auth\.missing"\n/);
   assert.match(ctx, /already updated these files and the catalogs on disk\. Tell the user in one or two sentences what Lyngo changed\. Do not edit those files or the catalogs again\./);
   const file = path.join(repo, 'resources', 'js', 'Hello.tsx');
@@ -1274,4 +1293,98 @@ test('localize applies an answer with "needs" when none of the needed files can 
   assert.equal(r.code, 0, r.out);
   assert.equal(localizeCalls().length, 1);
   assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('first answer')}</p>;\n");
+});
+
+// ── 0.2.11: the report counts every file the patch changed; the hook localizes the session's project ──
+
+const ENUM_COUNTS = { enums_read: 2, enums_targeted: 1, enums_added: 1, enums_existing: 0, resource: 2, prop: 0, text: 0, blade: 0, livewire: 0, table: 5, components: 0, types: 0, filament: 0, tables_reported: 1, left: 1 };
+
+test('localize counts the files a patch changes with no string wrapped, names the enum-label parts, and does not say "Nothing to change"', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ localizeEnumOnly: { counts: ENUM_COUNTS } });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /lyngo: 0 strings localized in 0 files; 0 new keys, 0 reused\.\n {2}files changed: 3\n {2}enum labels: 1 enum, 2 resources, 5 table columns\n/);
+  assert.doesNotMatch(r.stdout, /Nothing to change/);
+  assert.equal(fs.readFileSync(path.join(repo, 'app', 'Enums', 'ServerStatus.php'), 'utf8'), '<?php enum ServerStatus: string {}\n');
+});
+
+test('localize counts the catalogs apart, and an older server without enum_labels gets no enum-labels line', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ localizeEnumOnly: { catalog: true } });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /lyngo: 0 strings localized in 0 files; 1 new key, 0 reused\.\n {2}files changed: 3, catalogs changed: 1\n/);
+  assert.doesNotMatch(r.stdout, /enum labels/);
+  assert.doesNotMatch(r.stdout, /Nothing to change/);
+});
+
+test('localize with no patch still says "Nothing to change" and counts no file', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ localizeNothing: true });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /Nothing to change: every string a person reads already goes through an i18n call\./);
+  assert.doesNotMatch(r.stdout, /files changed|enum labels/);
+});
+
+test('localize --hook says what an enum-label patch changed when no string was wrapped, and gives the agent the new lines', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ localizeEnumOnly: { counts: ENUM_COUNTS } });
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.systemMessage, 'Lyngo: 3 files changed (enum labels)');
+  const ctx = out.hookSpecificOutput.additionalContext;
+  assert.match(ctx, /^lyngo: 0 strings localized in 0 files; 0 new keys, 0 reused\.\n {2}files changed: 3\n {2}enum labels: 1 enum, 2 resources, 5 table columns\n/);
+  assert.match(ctx, /Lyngo has already updated these files/);
+  assert.doesNotMatch(ctx, /Nothing to change/);
+});
+
+test('localize --hook keeps the strings line when strings were wrapped and adds the files the patch also changed', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ localizeEnumOnly: { counts: ENUM_COUNTS, wrapped: true, catalog: true } });
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(r.stdout).systemMessage, 'Lyngo: 1 string localized in 1 file, 1 new key, 2 more files changed (enum labels)');
+});
+
+function otherRepo() {
+  const other = path.join(scratch, 'other');
+  fs.mkdirSync(other, { recursive: true });
+  g(other, 'init', '-q', '-b', 'main');
+  return other;
+}
+
+test('localize --hook run from another repository localizes the project in CLAUDE_PROJECT_DIR', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const r = await run(['localize', '--hook'], { cwd: otherRepo(), input: STOP, env: { CLAUDE_PROJECT_DIR: repo } });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(r.stdout).systemMessage, 'Lyngo: 1 string localized in 1 file, 1 new key; fr: 1 translated');
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+  assert.ok(fs.existsSync(hookState(repo)));
+});
+
+test('localize --hook stays in the current directory when CLAUDE_PROJECT_DIR is unset, missing or not in a git repository; plain localize never reads it', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const other = otherRepo();
+  const plain = path.join(scratch, 'plain');
+  fs.mkdirSync(plain);
+  for (const env of [{}, { CLAUDE_PROJECT_DIR: plain }, { CLAUDE_PROJECT_DIR: path.join(scratch, 'missing') }]) {
+    const r = await run(['localize', '--hook'], { cwd: other, input: STOP, env });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(r.stdout, '', JSON.stringify(env));
+  }
+  const r = await run(['localize'], { cwd: other, env: { CLAUDE_PROJECT_DIR: repo } });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout, 'lyngo: nothing changed in the working tree.\n');
+  assert.equal(calls.length, 0);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
 });

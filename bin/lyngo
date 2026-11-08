@@ -776,6 +776,18 @@ function contextFiles(top, needs, payload) {
   return out;
 }
 
+// The paths a unified diff changes (its "+++ b/<path>" lines; a deleted file has none).
+function patchPaths(patch) {
+  return [...String(patch).matchAll(/^\+\+\+ b\/(.+?)\t?$/gm)].map((m) => m[1]);
+}
+
+// The parts of report.enum_labels.counts that are edits, with their words; the
+// rest (enums_read, left...) are not changes. An older server sends no counts.
+const ENUM_PARTS = [['enums_added', 'enum', 'enums'], ['resource', 'resource', 'resources'], ['prop', 'prop', 'props'], ['text', 'sentence', 'sentences'], ['blade', 'view', 'views'], ['livewire', 'Livewire view', 'Livewire views'], ['table', 'table column', 'table columns'], ['components', 'frontend read', 'frontend reads'], ['types', 'type', 'types'], ['filament', 'Filament label', 'Filament labels']];
+function enumLabelParts(counts) {
+  return ENUM_PARTS.filter(([k]) => counts[k] > 0).map(([k, one, many]) => `${counts[k]} ${counts[k] === 1 ? one : many}`);
+}
+
 async function localize(opts) {
   const top = root();
   process.chdir(top);
@@ -823,6 +835,9 @@ async function localize(opts) {
   const report = { files: [], added: [], reused: [], languages: {}, missing: new Set(), skipped: [], untranslated: {}, notes: [], warnings: new Set() };
   let batch = 0;
   let patched = false;
+  let gotPatch = false; // a patch came back (applied, or printed by --dry)
+  const changedPaths = new Set();
+  const enumCounts = {};
   while (files.length) {
     batch++;
     const payload = files.map((p) => ({ path: p, content: fs.readFileSync(p, 'utf8') }));
@@ -841,6 +856,8 @@ async function localize(opts) {
       r = await callJob('localize', { ...args, context }, progress);
     }
     if (r.patch && r.patch.trim()) {
+      gotPatch = true;
+      for (const p of patchPaths(r.patch)) changedPaths.add(p);
       if (opts.dry) { process.stdout.write(r.patch); }
       else {
         const tmp = path.join(os.tmpdir(), 'lyngo-' + Date.now() + '.patch');
@@ -863,6 +880,7 @@ async function localize(opts) {
     }
     report.skipped.push(...(r.report?.skipped || []));
     for (const w of r.report?.warnings || []) report.warnings.add(String(w));
+    for (const [k, v] of Object.entries(r.report?.enum_labels?.counts || {})) if (typeof v === 'number') enumCounts[k] = (enumCounts[k] || 0) + v;
     // What the server says beyond the steps this CLI takes itself (apply, call again).
     const note = String(r.next || '').replace(/Apply the patch, then call again with the files in "deferred"\.|Apply the patch with git apply, then show the user the report\./g, '').trim();
     if (note && !report.notes.includes(note)) report.notes.push(note);
@@ -878,6 +896,14 @@ async function localize(opts) {
   const wrapped = report.files.reduce((n, f) => n + f.wrapped.length, 0);
   say(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.`);
   for (const f of report.files) say(`  ${f.path}: ${f.wrapped.slice(0, 6).map((s) => JSON.stringify(s)).join(', ')}${f.wrapped.length > 6 ? ', …' : ''}`);
+  // Every file the patch changed, the enum-label edits too (they wrap no string); the catalogs apart.
+  const isCatalog = (p) => folders.some((f) => p.startsWith(f + '/'));
+  const editedFiles = [...changedPaths].filter((p) => !isCatalog(p));
+  const editedCatalogs = changedPaths.size - editedFiles.length;
+  const changedLine = [editedFiles.length ? `files changed: ${editedFiles.length}` : '', editedCatalogs ? `catalogs changed: ${editedCatalogs}` : ''].filter(Boolean).join(', ');
+  if (changedLine) say(`  ${changedLine}`);
+  const enumParts = enumLabelParts(enumCounts);
+  if (enumParts.length) say(`  enum labels: ${enumParts.join(', ')}`);
   if (opts['no-translate'] || (status.translate_on_localize === false && !Object.keys(report.languages).length)) say('  catalogs: not translated (keys only).');
   for (const [code, l] of Object.entries(report.languages)) {
     const flagged = l.flagged.length ? `; ${l.flagged.length} flagged for review: ${l.flagged.slice(0, 3).map((x) => JSON.stringify(x.key || x)).join(', ')}` : '';
@@ -887,9 +913,10 @@ async function localize(opts) {
   for (const [code, keys] of Object.entries(report.untranslated)) say(`  ${code}: ${keys.length} key${keys.length === 1 ? '' : 's'} not translated yet (${keys.slice(0, 3).map((k) => JSON.stringify(k)).join(', ')}${keys.length > 3 ? ', …' : ''}): run lyngo translate ${code}`);
   for (const sk of report.skipped) say(`  skipped ${sk.path}: ${sk.reason}`);
   for (const note of report.notes) say(`  ${note}`);
-  if (wrapped === 0 && report.added.length === 0) say('  Nothing to change: every string a person reads already goes through an i18n call.');
+  if (!gotPatch) say('  Nothing to change: every string a person reads already goes through an i18n call.');
   for (const line of warningLines(report.warnings)) say(line);
-  return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length, byLanguage: report.languages, sent: total, patched, lines };
+  const wrappedPaths = new Set(report.files.map((f) => f.path));
+  return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length, byLanguage: report.languages, sent: total, patched, lines, changedFiles: editedFiles.length, changedCatalogs: editedCatalogs, moreFiles: editedFiles.filter((p) => !wrappedPaths.has(p)).length, enumLabels: enumParts.length > 0 };
 }
 
 // ── the Claude Code Stop hook ──────────────────────────────────────────────
@@ -914,6 +941,15 @@ async function localizeHook(opts) {
   }
   // Claude is already continuing because of a stop hook: a second report would loop.
   if (input && input.stop_hook_active === true) return;
+  // Claude Code runs the hook in the session's current directory, which can be
+  // another repository (a live ~/.nvm): the project is where the session started.
+  // Not stdin's cwd, that is the same current directory.
+  const projectDir = process.env.CLAUDE_PROJECT_DIR;
+  if (projectDir) {
+    try {
+      if (fs.statSync(projectDir).isDirectory() && execFileSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: projectDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'true') process.chdir(projectDir);
+    } catch { /* not a directory in a git work tree: the current directory stands */ }
+  }
   let r;
   try {
     r = await localize(opts);
@@ -932,8 +968,14 @@ async function localizeHook(opts) {
   const langs = Object.entries(r.byLanguage)
     .filter(([, l]) => l.translated || l.from_memory || l.flagged.length)
     .map(([code, l]) => `${code}: ${l.translated} translated${l.from_memory ? `, ${l.from_memory} from memory` : ''}${l.flagged.length ? `, ${l.flagged.length} flagged for review` : ''}`);
+  const enumMark = r.enumLabels ? ' (enum labels)' : '';
+  // No string wrapped, but the patch changed files (enum labels): say what changed.
+  const what = [r.changedFiles ? n(r.changedFiles, 'file') : '', r.changedCatalogs ? n(r.changedCatalogs, 'catalog') : ''].filter(Boolean).join(' and ') || 'files';
+  const head = r.wrapped
+    ? `${n(r.wrapped, 'string')} localized in ${n(r.files, 'file')}, ${n(r.added, 'new key')}${r.reused ? `, ${r.reused} reused` : ''}${r.moreFiles ? `, ${r.moreFiles} more ${r.moreFiles === 1 ? 'file' : 'files'} changed${enumMark}` : ''}`
+    : `${what} changed${enumMark}${r.added ? `, ${n(r.added, 'new key')}` : ''}`;
   hookOut(
-    `Lyngo: ${n(r.wrapped, 'string')} localized in ${n(r.files, 'file')}, ${n(r.added, 'new key')}${r.reused ? `, ${r.reused} reused` : ''}${langs.length ? '; ' + langs.join('; ') : ''}`,
+    `Lyngo: ${head}${langs.length ? '; ' + langs.join('; ') : ''}`,
     clip(r.lines.join('\n'), HOOK_CLIP) + '\n\nLyngo has already updated these files and the catalogs on disk. Tell the user in one or two sentences what Lyngo changed. Do not edit those files or the catalogs again. If the user checks the page, rebuild the frontend first.',
   );
 }
