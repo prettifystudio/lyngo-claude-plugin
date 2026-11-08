@@ -749,6 +749,33 @@ async function allSourceFiles(top) {
 
 function sha1(p) { try { return crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex'); } catch { return null; } }
 
+// The paths a localize answer listed in "needs", read from the repository as
+// {path, content}: only source files (SRC, not SKIP, never .env or keys),
+// relative paths that stay inside it (no symlink out),
+// regular files of at most 512 KB, not already in the batch, 50 at most (the
+// server's limits). A missing or unreadable one is left out.
+const CONTEXT_MAX_FILES = 50;
+const CONTEXT_MAX_BYTES = 512 * 1024;
+function contextFiles(top, needs, payload) {
+  if (!Array.isArray(needs)) return [];
+  const sent = new Set(payload.map((f) => f.path));
+  let realTop;
+  try { realTop = fs.realpathSync(top); } catch { return []; }
+  const out = [];
+  for (const p of new Set(needs)) {
+    if (out.length >= CONTEXT_MAX_FILES) break;
+    if (typeof p !== 'string' || p === '' || sent.has(p) || p.includes('\0') || path.isAbsolute(p) || /^[A-Za-z]:/.test(p) || !SRC.test(p) || SKIP.test(p) || p.split(/[\\/]/).includes('..')) continue;
+    try {
+      const full = fs.realpathSync(path.join(realTop, p));
+      if (!full.startsWith(realTop + path.sep)) continue;
+      const st = fs.statSync(full);
+      if (!st.isFile() || st.size > CONTEXT_MAX_BYTES) continue;
+      out.push({ path: p, content: fs.readFileSync(full, 'utf8') });
+    } catch { /* missing or unreadable: left out */ }
+  }
+  return out;
+}
+
 async function localize(opts) {
   const top = root();
   process.chdir(top);
@@ -803,7 +830,16 @@ async function localize(opts) {
     if (opts.languages) args.languages = opts.languages.filter((l) => l !== status.primary_language);
     // --no-translate: keys only, catalogs for translators. Without the flag the project's setting decides.
     if (opts['no-translate']) args.translate = false;
-    const r = await callJob('localize', args, progress);
+    let r = await callJob('localize', args, progress);
+    // "needs": files this batch reads that the server took from GitHub, where
+    // the working tree may be ahead (an enum an unpushed run gave getLabel(),
+    // vito 2026-11-08). That answer is not applied: the batch goes once more
+    // with those files from disk as read-only context. Older servers never send it.
+    const context = contextFiles(top, r.needs, payload);
+    if (context.length) {
+      if (progress) progress(`  ... sending ${context.length} file${context.length === 1 ? '' : 's'} the server reads from this working tree, and the batch again`);
+      r = await callJob('localize', { ...args, context }, progress);
+    }
     if (r.patch && r.patch.trim()) {
       if (opts.dry) { process.stdout.write(r.patch); }
       else {

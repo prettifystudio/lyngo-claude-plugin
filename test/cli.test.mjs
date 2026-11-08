@@ -129,6 +129,19 @@ function handle(req, body) {
       : { patch: '', report: { files: [], primary: { added: [], already_there: [] }, languages: {}, catalogs_seen: sent }, deferred: [] });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
+  if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeNeeds) {
+    // "needs": the first answer names files the server read from GitHub, with a patch
+    // that must not be applied; the call with "context" gets the real patch (and "needs" again when state.needsAgain).
+    const retry = Array.isArray(body.params.arguments.context);
+    const said = retry ? "{t('Hello')}" : "{t('first answer')}";
+    const text = JSON.stringify({
+      patch: ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', '-export const Hello = () => <p>Hello</p>;', `+export const Hello = () => <p>${said}</p>;`, ''].join('\n'),
+      report: { files: [{ path: 'resources/js/Hello.tsx', wrapped: ['Hello'] }], primary: { added: ['Hello'], already_there: [] }, languages: {} },
+      deferred: [],
+      ...(retry && !state.needsAgain ? {} : { needs: state.localizeNeeds }),
+    });
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'localize') {
     const text = JSON.stringify({
       patch: ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', "-export const Hello = () => <p>Hello</p>;", "+export const Hello = () => <p>{t('Hello')}</p>;", ''].join('\n'),
@@ -1198,4 +1211,67 @@ test('translate prints the server warnings of every chunk once each', async () =
   const r = await run(['translate', 'fr'], { cwd: repo });
   assert.equal(r.code, 0, r.out);
   assert.match(r.stdout, /fr: 130 translated, 0 from memory -> lang\/fr\.json\n {2}warnings \(1\):\n {4}Machine text kept in the catalog: Key 3\n$/);
+});
+
+// ── needs and context: the working tree's copy of what the server read from GitHub ──
+
+const SERVER_STATUS = "<?php\n\nnamespace App\\Enums;\n\nenum ServerStatus: string\n{\n    case READY = 'ready';\n\n    public function getLabel(): string\n    {\n        return __('Ready');\n    }\n}\n";
+
+// Hello.tsx changed; the enum committed, so only the server's "needs" sends it.
+function needsRepo() {
+  const repo = helloRepo();
+  fs.mkdirSync(path.join(repo, 'app', 'Enums'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'app', 'Enums', 'ServerStatus.php'), SERVER_STATUS);
+  g(repo, 'add', 'app/Enums/ServerStatus.php');
+  g(repo, 'commit', '-q', '-m', 'enum');
+  return repo;
+}
+
+const localizeCalls = () => mcpCalls().filter((c) => c.body.params.name === 'localize');
+
+test('localize does not apply an answer with "needs": it sends the batch again with those files from disk as context, applies the second answer, and never loops', async () => {
+  loggedIn();
+  const repo = needsRepo();
+  // Outside the repository, a symlink out of it, missing, absolute, or already in the batch: all left out.
+  fs.writeFileSync(path.join(scratch, 'outside.php'), '<?php // secret\n');
+  fs.symlinkSync(path.join(scratch, 'outside.php'), path.join(repo, 'app', 'Link.php'));
+  fs.writeFileSync(path.join(repo, '.env'), 'APP_KEY=secret\n');
+  fs.mkdirSync(path.join(repo, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'config', 'services.php'), "<?php return ['key' => 'secret'];\n");
+  reset({ jobs: {}, localizeNeeds: ['app/Enums/ServerStatus.php', '.env', 'config/services.php', '../outside.php', 'app/Link.php', 'app/Missing.php', path.join(scratch, 'outside.php'), 'resources/js/Hello.tsx'], needsAgain: true });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const [first, second, ...more] = localizeCalls();
+  assert.equal(more.length, 0, 'one retry, whatever the second answer says');
+  assert.equal(first.body.params.arguments.context, undefined);
+  assert.deepEqual(second.body.params.arguments.context, [{ path: 'app/Enums/ServerStatus.php', content: SERVER_STATUS }]);
+  assert.deepEqual(second.body.params.arguments.files, first.body.params.arguments.files);
+  assert.deepEqual(second.body.params.arguments.catalogs, first.body.params.arguments.catalogs);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+  assert.ok(!r.out.includes('secret'));
+  assert.match(r.stdout, /sending 1 file the server reads from this working tree, and the batch again/);
+  assert.match(r.stdout, /1 string localized in 1 file; 1 new key, 0 reused\./);
+});
+
+test('localize --hook retries a batch with "needs" the same way, without a word on the terminal', async () => {
+  loggedIn();
+  const repo = needsRepo();
+  reset({ localizeNeeds: ['app/Enums/ServerStatus.php'] });
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stderr, '');
+  assert.equal(r.stdout.trim().split('\n').length, 1);
+  assert.equal(JSON.parse(r.stdout).systemMessage, 'Lyngo: 1 string localized in 1 file, 1 new key');
+  assert.deepEqual(localizeCalls().map((c) => c.body.params.arguments.context), [undefined, [{ path: 'app/Enums/ServerStatus.php', content: SERVER_STATUS }]]);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+});
+
+test('localize applies an answer with "needs" when none of the needed files can be read from the repository', async () => {
+  loggedIn();
+  const repo = needsRepo();
+  reset({ localizeNeeds: ['app/Missing.php', '../outside.php'] });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(localizeCalls().length, 1);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('first answer')}</p>;\n");
 });
