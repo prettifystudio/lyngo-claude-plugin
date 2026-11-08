@@ -152,7 +152,7 @@ function handle(req, body) {
     const target = a.catalogs.find((c) => c.path.endsWith('/' + code + '.json'));
     const current = JSON.parse(target.content || '{}');
     for (const k of a.keys) current[k] = `[${code}] ${k}`;
-    const text = JSON.stringify({ catalogs: [{ path: target.path, content: JSON.stringify(current, null, 2) + '\n' }], report: { languages: { [code]: { translated: a.keys.length, from_memory: 0, flagged: [] } } } });
+    const text = JSON.stringify({ catalogs: [{ path: target.path, content: JSON.stringify(current, null, 2) + '\n' }], report: { languages: { [code]: { translated: a.keys.length, from_memory: 0, flagged: [] } }, ...(state.translateReport || {}) } });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
   if (key === 'POST /mcp/admin') {
@@ -1149,4 +1149,53 @@ test('localize --hook tries again without a word on the terminal', async () => {
   assert.equal(r.code, 0, r.out);
   assert.equal(r.stderr, '');
   assert.equal(JSON.parse(r.stdout).systemMessage, 'Lyngo: 1 string localized in 1 file, 1 new key; fr: 1 translated');
+});
+
+// ── 0.2.10: the server's warnings reach the terminal and the agent ─────────
+
+const ENUM_WARNING = 'Enum labels, left as written: app/Tables/ServerTable.php:31 ServerTable status (ServerStatus): app/Enums/ServerStatus.php is not in this change';
+const warnings = (n) => Array.from({ length: n }, (_, i) => (i === 0 ? ENUM_WARNING : `Left as written: resources/js/Page${i}.tsx "Text ${i}"`));
+
+test('localize prints the server warnings once each, after the other report lines', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const three = warnings(3);
+  reset({ localizeReport: { warnings: [...three, three[0]] } });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(r.stdout.endsWith(['  warnings (3):', ...three.map((w) => '    ' + w)].join('\n') + '\n'), r.stdout);
+});
+
+test('localize shows the first 10 warnings and counts the rest; no warnings, no header', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const many = warnings(25);
+  reset({ localizeReport: { warnings: many } });
+  const r = await run(['localize', '--dry'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(r.stdout.endsWith(['  warnings (25):', ...many.slice(0, 10).map((w) => '    ' + w), '    … and 15 more'].join('\n') + '\n'), r.stdout);
+  reset();
+  const none = await run(['localize', '--dry'], { cwd: repo });
+  assert.equal(none.code, 0, none.out);
+  assert.doesNotMatch(none.stdout, /warnings \(/);
+});
+
+test('localize --hook passes the warnings to the agent', async () => {
+  loggedIn();
+  reset({ localizeReport: { warnings: warnings(3) } });
+  const r = await run(['localize', '--hook'], { cwd: helloRepo(), input: STOP });
+  assert.equal(r.code, 0, r.out);
+  const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(ctx.includes(['  warnings (3):', ...warnings(3).map((w) => '    ' + w)].join('\n') + '\n\nLyngo has already updated'), ctx);
+});
+
+test('translate prints the server warnings of every chunk once each', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), JSON.stringify(Object.fromEntries(Array.from({ length: 130 }, (_, i) => [`Key ${i}`, `Key ${i}`]))) + '\n');
+  reset({ translateReport: { warnings: ['Machine text kept in the catalog: Key 3'] } });
+  const r = await run(['translate', 'fr'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /fr: 130 translated, 0 from memory -> lang\/fr\.json\n {2}warnings \(1\):\n {4}Machine text kept in the catalog: Key 3\n$/);
 });

@@ -524,6 +524,17 @@ async function fillMissingCatalogs(project, opts) {
 function catalogFolder(project) { return ((project.i18n && project.i18n.catalog_folder) || 'lang').replace(/\/+$/, ''); }
 function parseCatalog(p) { try { return JSON.parse(readIfFile(p) || ''); } catch { return null; } }
 
+// The server's warnings: texts left as written, values a database may store,
+// machine text kept in a catalog. Capped, so a long --all run stays readable.
+const WARNINGS_SHOWN = 10;
+function warningLines(warnings) {
+  const list = [...warnings];
+  if (!list.length) return [];
+  const out = [`  warnings (${list.length}):`, ...list.slice(0, WARNINGS_SHOWN).map((w) => `    ${w}`)];
+  if (list.length > WARNINGS_SHOWN) out.push(`    … and ${list.length - WARNINGS_SHOWN} more`);
+  return out;
+}
+
 // ── translate: fill a language's catalog from the primary one ─────────────
 async function translate(opts) {
   const top = root();
@@ -550,6 +561,7 @@ async function translateLanguage(code, project) {
   const missing = Object.keys(source).filter((k) => !(k in current) || String(current[k]).trim() === '');
   if (!missing.length) { console.log(`${code}: complete, ${Object.keys(source).length} keys.`); return; }
   let translated = 0, memory = 0, flagged = [];
+  const warnings = new Set();
   // Each chunk is one job on the server; the returned catalog carries forward.
   for (let i = 0; i < missing.length; i += 100) {
     const r = await callJob('translate', {
@@ -563,10 +575,12 @@ async function translateLanguage(code, project) {
     fs.writeFileSync(targetPath, out.content);
     const l = (r.report && r.report.languages && r.report.languages[code]) || {};
     translated += l.translated || 0; memory += l.from_memory || 0; flagged.push(...(l.flagged || []));
+    for (const w of (r.report && r.report.warnings) || []) warnings.add(String(w));
     if (process.stdout.isTTY) process.stdout.write(`\r${code}: ${Math.min(i + 100, missing.length)}/${missing.length}`);
   }
   const flaggedText = flagged.length ? `; ${flagged.length} flagged for review: ${flagged.slice(0, 3).map((x) => JSON.stringify(x.key || x)).join(', ')}` : '';
   console.log(`${process.stdout.isTTY ? '\r' : ''}${code}: ${translated} translated, ${memory} from memory${flaggedText} -> ${targetPath}`);
+  for (const line of warningLines(warnings)) console.log(line);
 }
 
 // ── onboard: the "copy this into your agent" path ──────────────────────────
@@ -779,7 +793,7 @@ async function localize(opts) {
   if (opts.all) say(`lyngo: localizing ${total} file${total === 1 ? '' : 's'} in batches; each batch applies before the next.`);
   // Progress while a job runs goes to the terminal; the hook keeps its output to the report.
   const progress = opts.hook ? null : (line) => console.log(line);
-  const report = { files: [], added: [], reused: [], languages: {}, missing: new Set(), skipped: [], untranslated: {}, notes: [] };
+  const report = { files: [], added: [], reused: [], languages: {}, missing: new Set(), skipped: [], untranslated: {}, notes: [], warnings: new Set() };
   let batch = 0;
   let patched = false;
   while (files.length) {
@@ -812,6 +826,7 @@ async function localize(opts) {
       if (l.untranslated?.length) (report.untranslated[code] = report.untranslated[code] || []).push(...l.untranslated);
     }
     report.skipped.push(...(r.report?.skipped || []));
+    for (const w of r.report?.warnings || []) report.warnings.add(String(w));
     // What the server says beyond the steps this CLI takes itself (apply, call again).
     const note = String(r.next || '').replace(/Apply the patch, then call again with the files in "deferred"\.|Apply the patch with git apply, then show the user the report\./g, '').trim();
     if (note && !report.notes.includes(note)) report.notes.push(note);
@@ -837,6 +852,7 @@ async function localize(opts) {
   for (const sk of report.skipped) say(`  skipped ${sk.path}: ${sk.reason}`);
   for (const note of report.notes) say(`  ${note}`);
   if (wrapped === 0 && report.added.length === 0) say('  Nothing to change: every string a person reads already goes through an i18n call.');
+  for (const line of warningLines(report.warnings)) say(line);
   return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length, byLanguage: report.languages, sent: total, patched, lines };
 }
 
