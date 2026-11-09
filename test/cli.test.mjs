@@ -204,8 +204,10 @@ before(async () => {
       const fault = state.faults && next(state.faults);
       if (fault === 'reset') { req.socket.resetAndDestroy(); return; }
       if (fault) { res.writeHead(fault, { 'Content-Type': 'text/html' }); res.end(`<html>error ${fault}</html>`); return; }
+      // state.headers ride on every answer (X-Lyngo-Cli-Latest...); state.tooOld answers every request with 426 and that body.
+      if (state.tooOld) { res.writeHead(426, { 'Content-Type': 'application/json', ...state.headers }); res.end(JSON.stringify(state.tooOld)); return; }
       const [status, payload] = handle(req, body);
-      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.writeHead(status, { 'Content-Type': 'application/json', ...state.headers });
       res.end(payload === null ? '' : JSON.stringify(payload));
     });
   });
@@ -252,14 +254,14 @@ function safePath(extra = []) {
   return [...new Set(dirs)].join(path.delimiter);
 }
 
-function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {} } = {}) {
+function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {}, bin = BIN } = {}) {
   const env = { ...process.env, HOME: home(), LYNGO_HOST: base, LYNGO_NO_BROWSER: '1', LYNGO_TICK_MS: '1', PATH: safePath([...pathDirs, fakeInstallers().dir]), GIT_TERMINAL_PROMPT: '0', ...extra };
   delete env.LYNGO_TOKEN;
   delete env.LYNGO_URL;
   if (!('CI' in extra)) delete env.CI; // a CI runner sets it; init sees it only where a test says so
   if (!('CLAUDE_PROJECT_DIR' in extra)) delete env.CLAUDE_PROJECT_DIR; // set when the suite runs inside Claude Code: the hook would go there
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [BIN, ...args], { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [bin, ...args], { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
     if (input !== undefined) child.stdin.end(input);
     let stdout = '';
     let stderr = '';
@@ -1386,5 +1388,141 @@ test('localize --hook stays in the current directory when CLAUDE_PROJECT_DIR is 
   assert.equal(r.code, 0, r.out);
   assert.equal(r.stdout, 'lyngo: nothing changed in the working tree.\n');
   assert.equal(calls.length, 0);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
+});
+
+// ── 0.2.12: the version in User-Agent, the update line, the refusal of an old CLI ──
+
+const VERSION = JSON.parse(fs.readFileSync(path.resolve(path.dirname(BIN), '..', 'package.json'), 'utf8')).version;
+const UPDATE = 'npm i -g @prettifystudio/lyngo-cli';
+const TOO_OLD = { error: 'cli_too_old', message: `This lyngo CLI (${VERSION}) is too old; Lyngo needs 9.0.0 or newer. Update it: ${UPDATE}` };
+const noticeFile = () => path.join(home(), '.config', 'lyngo', 'update-notice.json');
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const bumped = (v) => { const [a, b, c] = v.split('.').map(Number); return `${a}.${b}.${c + 1}`; };
+
+// A copy of the CLI that reports `version`: the comparison runs on chosen numbers.
+function cliAt(version) {
+  const dir = path.join(scratch, 'cli-' + version);
+  fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
+  fs.copyFileSync(BIN, path.join(dir, 'bin', 'lyngo'));
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ version }));
+  return path.join(dir, 'bin', 'lyngo');
+}
+
+test('every request names the CLI version in User-Agent: the /cli calls and the MCP calls', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  assert.equal((await run(['whoami'], { cwd: repo })).code, 0);
+  assert.equal((await run(['status'], { cwd: repo })).code, 0);
+  assert.deepEqual([...new Set(calls.map((c) => c.path))], ['/cli/me', '/mcp/admin']);
+  for (const c of calls) assert.match(c.headers['user-agent'], new RegExp(`^lyngo-cli/${esc(VERSION)} \\(node v\\d+\\.\\d+\\.\\d+; ${process.platform}\\)$`));
+});
+
+test('a newer CLI on the server prints one line on stderr, once a day per latest version', async () => {
+  loggedIn();
+  const latest = bumped(VERSION);
+  reset({ headers: { 'X-Lyngo-Cli-Latest': latest, 'X-Lyngo-Cli-Minimum': '0.2.0' } });
+  const line = `Lyngo CLI ${latest} is available (you have ${VERSION}): ${UPDATE}\n`;
+  const first = await run(['whoami']);
+  assert.equal(first.code, 0, first.out);
+  assert.equal(first.stderr, line);
+  assert.doesNotMatch(first.stdout, /available/);
+  assert.equal(JSON.parse(fs.readFileSync(noticeFile(), 'utf8')).latest, latest);
+  assert.equal(fs.statSync(noticeFile()).mode & 0o777, 0o600);
+
+  // The same day: no second line.
+  const again = await run(['whoami']);
+  assert.equal(again.code, 0, again.out);
+  assert.equal(again.stderr, '');
+
+  // A day later, or a newer latest the same day: the line again.
+  fs.writeFileSync(noticeFile(), JSON.stringify({ latest, shown_at: new Date(Date.now() - 25 * 3600 * 1000).toISOString() }));
+  assert.equal((await run(['whoami'])).stderr, line);
+  const newer = bumped(latest);
+  reset({ headers: { 'X-Lyngo-Cli-Latest': newer } });
+  assert.equal((await run(['whoami'])).stderr, `Lyngo CLI ${newer} is available (you have ${VERSION}): ${UPDATE}\n`);
+});
+
+test('versions compare as numbers: 0.2.10 is newer than 0.2.9, and an equal or older latest prints nothing', async () => {
+  loggedIn();
+  reset({ headers: { 'X-Lyngo-Cli-Latest': '0.2.10' } });
+  const old = await run(['whoami'], { bin: cliAt('0.2.9') });
+  assert.equal(old.code, 0, old.out);
+  assert.equal(old.stderr, `Lyngo CLI 0.2.10 is available (you have 0.2.9): ${UPDATE}\n`);
+  assert.match(calls[0].headers['user-agent'], /^lyngo-cli\/0\.2\.9 \(node /);
+  fs.rmSync(noticeFile());
+  for (const v of ['0.2.10', '0.2.11', '0.10.0']) {
+    const r = await run(['whoami'], { bin: cliAt(v) });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(r.stderr, '', v);
+  }
+  reset(); // no header: no line
+  assert.equal((await run(['whoami'], { bin: cliAt('0.0.1') })).stderr, '');
+});
+
+test('localize --dry keeps the update line off stdout', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ headers: { 'X-Lyngo-Cli-Latest': bumped(VERSION) } });
+  const r = await run(['localize', '--dry'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /^diff --git a\/resources\/js\/Hello\.tsx/);
+  assert.doesNotMatch(r.stdout, /is available/);
+  assert.equal(r.stderr, `Lyngo CLI ${bumped(VERSION)} is available (you have ${VERSION}): ${UPDATE}\n`);
+});
+
+test('localize --hook puts the update line in its JSON, for the person and the agent, once a day; nothing on stderr', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const latest = bumped(VERSION);
+  const notice = `Lyngo CLI ${latest} is available (you have ${VERSION}): ${UPDATE}`;
+  reset({ headers: { 'X-Lyngo-Cli-Latest': latest } });
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stderr, '');
+  assert.equal(r.stdout.trim().split('\n').length, 1);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.systemMessage, `Lyngo: 1 string localized in 1 file, 1 new key; fr: 1 translated. ${notice}`);
+  assert.match(out.hookSpecificOutput.additionalContext, new RegExp(`Do not edit those files or the catalogs again\\..*\\n\\n${esc(notice)}\\. Tell the user in one sentence that a newer Lyngo CLI is available, with that command\\.$`, 's'));
+
+  // The next stop the same day: the report alone.
+  reset({ localizeNothing: true, headers: { 'X-Lyngo-Cli-Latest': latest } });
+  fs.appendFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Bye = 1;\n');
+  const again = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(again.code, 0, again.out);
+  assert.deepEqual(JSON.parse(again.stdout), { systemMessage: 'Lyngo: checked 1 file, nothing to localize' });
+});
+
+test('a CLI the server refuses (426) prints the server message and exits 1, on /cli and on MCP calls, with no update line', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  reset({ tooOld: TOO_OLD, headers: { 'X-Lyngo-Cli-Latest': '9.0.0', 'X-Lyngo-Cli-Minimum': '9.0.0' } });
+  for (const cmd of [['whoami'], ['status'], ['login'], ['logout']]) {
+    const r = await run(cmd, { cwd: repo });
+    assert.equal(r.code, 1, cmd[0]);
+    assert.equal(r.stderr, `lyngo: ${TOO_OLD.message}\n`, cmd[0]);
+  }
+  assert.deepEqual([...new Set(calls.map((c) => c.path))], ['/cli/me', '/mcp/admin', '/cli/device', '/cli/token']);
+  assert.ok(!fs.existsSync(path.join(home(), '.config', 'lyngo', 'token')), 'logout still deletes the token file');
+  assert.ok(!fs.existsSync(noticeFile()));
+
+  // A body without a message (a proxy in between): the CLI says it itself.
+  loggedIn();
+  reset({ tooOld: {}, headers: { 'X-Lyngo-Cli-Minimum': '9.0.0' } });
+  const r = await run(['whoami'], { cwd: repo });
+  assert.equal(r.code, 1);
+  assert.equal(r.stderr, `lyngo: this lyngo CLI (${VERSION}) is too old; Lyngo needs 9.0.0 or newer. Update it: ${UPDATE}\n`);
+});
+
+test('localize --hook turns a refusal (426) into its error line with the update command, and exits 0', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ tooOld: TOO_OLD, headers: { 'X-Lyngo-Cli-Latest': '9.0.0' } });
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stderr, '');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.systemMessage, `Lyngo: ${TOO_OLD.message}`);
+  assert.equal(out.hookSpecificOutput.additionalContext, `Lyngo could not localize the changes: ${TOO_OLD.message}. Tell the user, with the fix: update the CLI with ${UPDATE}, then run /lyngo:localize.`);
   assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
 });

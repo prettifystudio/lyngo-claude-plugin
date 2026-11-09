@@ -42,9 +42,9 @@ const SRC = /\.(blade\.php|php|tsx|jsx|ts|js|vue|svelte)$/;
 const SKIP = /(^|\/)(vendor|node_modules|tests?|database|storage|bootstrap|public|config|\.git)\//;
 
 class CliError extends Error {}
+class CliTooOld extends CliError {} // the server refused this version (HTTP 426)
 
 function fail(msg) { throw new CliError(msg); }
-function die(msg, code = 1) { console.error('lyngo: ' + msg); process.exit(code); }
 const sleep = (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * TICK));
 
 // ── git ────────────────────────────────────────────────────────────────────
@@ -86,6 +86,45 @@ function saveToken(t) {
 // Never let a token reach the terminal: replace it with its prefix.
 function scrub(text, t) { return t ? String(text).split(t).join(prefixOf(t)) : String(text); }
 
+// ── version and the update notice ──────────────────────────────────────────
+// Every request names this version in User-Agent. The server answers with the
+// newest CLI (X-Lyngo-Cli-Latest) and the oldest one it accepts
+// (X-Lyngo-Cli-Minimum), and refuses a CLI below that one with HTTP 426.
+
+function version() {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '0.1.0'; } catch { return '0.1.0'; }
+}
+const VERSION = version();
+const USER_AGENT = `lyngo-cli/${VERSION} (node ${process.version}; ${process.platform})`;
+const UPDATE_COMMAND = 'npm i -g @prettifystudio/lyngo-cli';
+const NOTICE_FILE = path.join(TOKEN_DIR, 'update-notice.json');
+const DAY_MS = 24 * 60 * 60 * 1000;
+let latestSeen = null; // X-Lyngo-Cli-Latest of the last answer
+let refused = false; // a 426 already says to update
+
+// Numbers, not strings: 0.2.10 is newer than 0.2.9. A pre-release tag is ignored.
+function compareVersions(a, b) {
+  const parts = (v) => { const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(v).trim()); return m ? m.slice(1).map(Number) : null; };
+  const x = parts(a), y = parts(b);
+  if (!x || !y) return 0;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+  return 0;
+}
+
+// The update line, at most once a day per machine and per latest version
+// (~/.config/lyngo/update-notice.json); null when none is due.
+function updateNotice() {
+  if (refused || !latestSeen || compareVersions(VERSION, latestSeen) >= 0) return null;
+  let last = {};
+  try { last = JSON.parse(fs.readFileSync(NOTICE_FILE, 'utf8')) || {}; } catch { /* never shown on this machine */ }
+  if (last.latest === latestSeen && Date.now() - Date.parse(last.shown_at) < DAY_MS) return null;
+  try {
+    fs.mkdirSync(TOKEN_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(NOTICE_FILE, JSON.stringify({ latest: latestSeen, shown_at: new Date().toISOString() }) + '\n', { mode: 0o600 });
+  } catch { /* shown again next time: better than never */ }
+  return `Lyngo CLI ${latestSeen} is available (you have ${VERSION}): ${UPDATE_COMMAND}`;
+}
+
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
 // One dropped connection must not end a long run: localize --all on 1554 files
@@ -98,7 +137,7 @@ const RETRY_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524]);
 let quiet = false; // the Stop hook prints one JSON object and nothing else (localizeHook)
 
 async function request(method, url, { body, auth = true, accept = 'application/json' } = {}) {
-  const headers = { Accept: accept };
+  const headers = { Accept: accept, 'User-Agent': USER_AGENT };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (auth) headers.Authorization = 'Bearer ' + readToken();
   const remote = repoRemote();
@@ -130,6 +169,13 @@ async function request(method, url, { body, auth = true, accept = 'application/j
       const line = text.split('\n').filter((l) => l.startsWith('data:')).pop();
       try { data = line ? JSON.parse(line.slice(5)) : { message: text.slice(0, 200) }; } catch { data = { message: text.slice(0, 200) }; }
     }
+  }
+  const latest = res.headers.get('x-lyngo-cli-latest');
+  if (latest) latestSeen = latest.trim();
+  if (res.status === 426) {
+    refused = true;
+    const minimum = res.headers.get('x-lyngo-cli-minimum');
+    throw new CliTooOld(data.message || `this lyngo CLI (${VERSION}) is too old${minimum ? `; Lyngo needs ${minimum} or newer` : ''}. Update it: ${UPDATE_COMMAND}`);
   }
   if (auth && res.status === 401) fail('the token was refused (revoked or expired). Run lyngo login.');
   if (res.status === 429) fail('too many calls. Wait a minute and try again.');
@@ -244,11 +290,13 @@ async function logout() {
   const t = readToken(false);
   if (!t) { console.log('Not logged in.'); return; }
   let revoked = false;
+  let tooOld = null;
   try {
     const r = await api('DELETE', '/cli/token');
     revoked = r.status === 204 || r.status === 200;
-  } catch { /* the local file goes anyway */ }
+  } catch (e) { if (e instanceof CliTooOld) tooOld = e; /* the local file goes anyway */ }
   if (fs.existsSync(TOKEN_FILE)) fs.unlinkSync(TOKEN_FILE);
+  if (tooOld) throw tooOld;
   console.log(revoked ? `Logged out. Token ${prefixOf(t)} is revoked.` : `Logged out on this machine. The server did not confirm that token ${prefixOf(t)} is revoked; revoke it in Settings, CLI.`);
   if (process.env.LYNGO_TOKEN) console.log('Note: LYNGO_TOKEN is still set in your environment.');
 }
@@ -927,7 +975,10 @@ async function localize(opts) {
 const HOOK_CLIP = 7000; // each field is capped at 10,000 characters, and JSON escaping adds some
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 function hookOut(systemMessage, context) {
-  const out = { systemMessage: clip(systemMessage, 500) };
+  // The update line goes with the report, never alone: it does not wake the agent by itself.
+  const notice = updateNotice();
+  const out = { systemMessage: notice ? `${clip(systemMessage, 300)}. ${notice}` : clip(systemMessage, 500) };
+  if (context && notice) context += `\n\n${notice}. Tell the user in one sentence that a newer Lyngo CLI is available, with that command.`;
   if (context) out.hookSpecificOutput = { hookEventName: 'Stop', additionalContext: context };
   process.stdout.write(JSON.stringify(out) + '\n');
 }
@@ -956,7 +1007,8 @@ async function localizeHook(opts) {
   } catch (e) {
     const t = (() => { try { return readToken(false); } catch { return null; } })();
     const msg = scrub((e && e.message) || String(e), t).replace(/\s+/g, ' ').trim().replace(/\.$/, '');
-    const fix = /\blogin\b/i.test(msg) ? 'run /lyngo:login (or lyngo login in a terminal)'
+    const fix = e instanceof CliTooOld ? `update the CLI with ${UPDATE_COMMAND}, then run /lyngo:localize`
+      : /\blogin\b/i.test(msg) ? 'run /lyngo:login (or lyngo login in a terminal)'
       : /lyngo init/i.test(msg) ? 'run /lyngo:init (or lyngo init in a terminal)'
       : 'run /lyngo:localize to try again';
     hookOut('Lyngo: ' + msg, `Lyngo could not localize the changes: ${clip(msg, HOOK_CLIP)}. Tell the user, with the fix: ${fix}.`);
@@ -1002,11 +1054,7 @@ async function status() {
 
 // ── entry ──────────────────────────────────────────────────────────────────
 
-function version() {
-  try { return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '0.1.0'; } catch { return '0.1.0'; }
-}
-
-const HELP = `lyngo ${version()}: localization for your repository, from the terminal.
+const HELP = `lyngo ${VERSION}: localization for your repository, from the terminal.
 
   lyngo login                       sign in once (opens the browser)
   lyngo logout                      revoke the token and delete it from this machine
@@ -1029,6 +1077,13 @@ const HELP = `lyngo ${version()}: localization for your repository, from the ter
   lyngo status                      the project as Lyngo knows it
 
 Config: LYNGO_HOST (default https://lyngo.app), LYNGO_TOKEN or ~/.config/lyngo/token.`;
+
+// On stderr, so stdout stays the command's own output (a --dry patch). The hook prints it in its JSON.
+function printUpdateNotice() {
+  if (quiet) return;
+  const notice = updateNotice();
+  if (notice) console.error(notice);
+}
 
 function parse(argv) {
   const opts = { _: [] };
@@ -1054,7 +1109,7 @@ function parse(argv) {
 (async () => {
   try {
     const [cmd, ...rest] = process.argv.slice(2);
-    if (cmd === '--version' || cmd === '-v' || cmd === 'version') { console.log(version()); return; }
+    if (cmd === '--version' || cmd === '-v' || cmd === 'version') { console.log(VERSION); return; }
     if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { console.log(HELP); return; }
     const opts = parse(rest);
     if (opts.help) { console.log(HELP); return; }
@@ -1072,6 +1127,9 @@ function parse(argv) {
     }
   } catch (e) {
     const t = (() => { try { return readToken(false); } catch { return null; } })();
-    die(scrub(e instanceof CliError ? e.message : (e && e.message) || String(e), t));
+    console.error('lyngo: ' + scrub(e instanceof CliError ? e.message : (e && e.message) || String(e), t));
+    printUpdateNotice();
+    process.exit(1);
   }
+  printUpdateNotice();
 })();
