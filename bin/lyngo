@@ -397,7 +397,22 @@ async function chooseLanguages(project, opts) {
   return updated;
 }
 
-function readIfFile(p) { try { return fs.statSync(p).isFile() ? fs.readFileSync(p, 'utf8') : null; } catch { return null; } }
+// File content goes to the server only as valid UTF-8. A Latin-1 file read as
+// 'utf8' turns each accented byte into U+FFFD, the server's patch is built on
+// that text, and git apply refuses it (lyngo-gaps cafe.blade.php, 2026-11-11).
+// ignoreBOM keeps a BOM in the text, so the patch still matches the file.
+const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+function utf8(bytes) { try { return UTF8.decode(bytes); } catch { return null; } }
+// The text of a regular file, or null (missing, not a file, not UTF-8). A file
+// that is not UTF-8 is added to notUtf8 when the caller passes that Set.
+function readIfFile(p, notUtf8) {
+  let bytes;
+  try { if (!fs.statSync(p).isFile()) return null; bytes = fs.readFileSync(p); } catch { return null; }
+  const text = utf8(bytes);
+  if (text === null && notUtf8) notUtf8.add(p);
+  return text;
+}
+const notUtf8Line = (p) => `  left as written, not UTF-8: ${p}`;
 
 // The package manager install after the setup patch: without it Vite cannot
 // resolve the new imports and the page goes blank (vito, Inertia React). Run as a
@@ -801,10 +816,10 @@ function sha1(p) { try { return crypto.createHash('sha1').update(fs.readFileSync
 // {path, content}: only source files (SRC, not SKIP, never .env or keys),
 // relative paths that stay inside it (no symlink out),
 // regular files of at most 512 KB, not already in the batch, 50 at most (the
-// server's limits). A missing or unreadable one is left out.
+// server's limits). A missing or unreadable one is left out, and so is one that is not UTF-8 (named in notUtf8).
 const CONTEXT_MAX_FILES = 50;
 const CONTEXT_MAX_BYTES = 512 * 1024;
-function contextFiles(top, needs, payload) {
+function contextFiles(top, needs, payload, notUtf8) {
   if (!Array.isArray(needs)) return [];
   const sent = new Set(payload.map((f) => f.path));
   let realTop;
@@ -818,7 +833,9 @@ function contextFiles(top, needs, payload) {
       if (!full.startsWith(realTop + path.sep)) continue;
       const st = fs.statSync(full);
       if (!st.isFile() || st.size > CONTEXT_MAX_BYTES) continue;
-      out.push({ path: p, content: fs.readFileSync(full, 'utf8') });
+      const content = utf8(fs.readFileSync(full));
+      if (content === null) { if (notUtf8) notUtf8.add(p); continue; }
+      out.push({ path: p, content });
     } catch { /* missing or unreadable: left out */ }
   }
   return out;
@@ -827,6 +844,36 @@ function contextFiles(top, needs, payload) {
 // The paths a unified diff changes (its "+++ b/<path>" lines; a deleted file has none).
 function patchPaths(patch) {
   return [...String(patch).matchAll(/^\+\+\+ b\/(.+?)\t?$/gm)].map((m) => m[1]);
+}
+
+// git apply is all or nothing: one block that does not apply (a file the server
+// read differently) dropped the 8 good files of its batch with it (lyngo-gaps,
+// 2026-11-11). When the whole patch fails, each file's "diff --git" block goes
+// alone. Returns the paths applied and, for the rest, git's reason.
+function gitApply(text) {
+  const tmp = path.join(os.tmpdir(), `lyngo-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.patch`);
+  fs.writeFileSync(tmp, text);
+  try { git(['apply', '--whitespace=nowarn', tmp]); return null; }
+  catch (e) { return String(e.stderr || e.message || 'git apply failed').trim().split('\n').map((l) => l.replace(/^error: /, '').trim()).filter(Boolean).join('; '); }
+  finally { try { fs.unlinkSync(tmp); } catch { /* already gone */ } }
+}
+function blockPath(block) {
+  const m = block.match(/^\+\+\+ b\/(.+?)\t?$/m) || block.match(/^--- a\/(.+?)\t?$/m) || block.match(/^diff --git a\/(.+?) b\//);
+  return m ? m[1] : '(unknown file)';
+}
+function applyPatch(patch) {
+  const whole = gitApply(patch);
+  if (whole === null) return { applied: patchPaths(patch), failed: [], split: false };
+  const blocks = String(patch).split(/^(?=diff --git )/m).filter((b) => b.startsWith('diff --git '));
+  if (blocks.length === 0) return { applied: [], failed: [{ path: '(the patch)', reason: whole, block: patch }], split: false };
+  const applied = [];
+  const failed = [];
+  for (const b of blocks) {
+    const block = b.endsWith('\n') ? b : b + '\n';
+    const reason = gitApply(block);
+    if (reason === null) applied.push(blockPath(block)); else failed.push({ path: blockPath(block), reason, block });
+  }
+  return { applied, failed, split: true };
 }
 
 // The parts of report.enum_labels.counts that are edits, with their words; the
@@ -851,7 +898,21 @@ async function localize(opts) {
   const changed = files;
   const statePath = opts.hook ? path.resolve(top, git(['rev-parse', '--git-path', 'lyngo-hook.json']).trim()) : null;
   if (statePath) { const seen = parseCatalog(statePath) || {}; files = files.filter((p) => seen[p] !== sha1(p)); }
-  if (files.length === 0) { say(opts.all ? 'lyngo: no source file of this project found in the repository.' : 'lyngo: nothing changed in the working tree.'); return null; }
+  // A file that is not UTF-8 is never sent (readIfFile): it is named and left as written.
+  // The hook state records it, so the next stop does not name it again.
+  const notUtf8 = new Set();
+  files = files.filter((p) => readIfFile(p, notUtf8) !== null);
+  // Recorded after the patch, so the hook's own changes never count as new edits;
+  // a file whose block did not apply is left out, so the next stop sends it again.
+  const failedPaths = new Set();
+  const saveHookState = () => { if (statePath) fs.writeFileSync(statePath, JSON.stringify(Object.fromEntries(changed.filter((p) => !failedPaths.has(p)).map((p) => [p, sha1(p)]))) + '\n'); };
+  if (files.length === 0) {
+    if (!notUtf8.size) { say(opts.all ? 'lyngo: no source file of this project found in the repository.' : 'lyngo: nothing changed in the working tree.'); return null; }
+    say(`lyngo: nothing sent; ${notUtf8.size} file${notUtf8.size === 1 ? ' is' : 's are'} not UTF-8.`);
+    for (const p of notUtf8) say(notUtf8Line(p));
+    saveHookState();
+    return { wrapped: 0, files: 0, added: 0, reused: 0, languages: 0, byLanguage: {}, sent: 0, patched: false, lines, changedFiles: 0, changedCatalogs: 0, moreFiles: 0, enumLabels: false, notUtf8: [...notUtf8], failed: [] };
+  }
   const status = await call('status', {});
   const langs = opts.languages || [status.primary_language, ...(status.languages || [])];
   // Both catalog folders (Laravel's lang and the frontend's own), read again
@@ -866,13 +927,14 @@ async function localize(opts) {
     const out = [];
     for (const folder of folders) for (const code of langs) {
       const p = path.join(folder, code + '.json');
-      if (fs.existsSync(p)) out.push({ path: p, content: fs.readFileSync(p, 'utf8') });
+      const c = readIfFile(p, notUtf8);
+      if (c !== null) out.push({ path: p, content: c });
     }
     for (const code of langs) {
       const dir = path.join(phpFolder, code);
       let names = [];
       try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.php')).sort(); } catch { /* no PHP lang files for this language */ }
-      for (const n of names) { const c = readIfFile(path.join(dir, n)); if (c !== null) out.push({ path: path.join(dir, n), content: c }); }
+      for (const n of names) { const c = readIfFile(path.join(dir, n), notUtf8); if (c !== null) out.push({ path: path.join(dir, n), content: c }); }
     }
     return out;
   };
@@ -885,10 +947,13 @@ async function localize(opts) {
   let patched = false;
   let gotPatch = false; // a patch came back (applied, or printed by --dry)
   const changedPaths = new Set();
+  const failed = []; // {path, reason, block} of each file whose block did not apply
   const enumCounts = {};
   while (files.length) {
     batch++;
-    const payload = files.map((p) => ({ path: p, content: fs.readFileSync(p, 'utf8') }));
+    const payload = [];
+    for (const p of files) { const c = readIfFile(p, notUtf8); if (c !== null) payload.push({ path: p, content: c }); }
+    if (payload.length === 0) break;
     const args = { files: payload, catalogs: catalogsNow(), format: 'patch' };
     if (opts.languages) args.languages = opts.languages.filter((l) => l !== status.primary_language);
     // --no-translate: keys only, catalogs for translators. Without the flag the project's setting decides.
@@ -898,22 +963,24 @@ async function localize(opts) {
     // the working tree may be ahead (an enum an unpushed run gave getLabel(),
     // vito 2026-11-08). That answer is not applied: the batch goes once more
     // with those files from disk as read-only context. Older servers never send it.
-    const context = contextFiles(top, r.needs, payload);
+    const context = contextFiles(top, r.needs, payload, notUtf8);
     if (context.length) {
       if (progress) progress(`  ... sending ${context.length} file${context.length === 1 ? '' : 's'} the server reads from this working tree, and the batch again`);
       r = await callJob('localize', { ...args, context }, progress);
     }
     if (r.patch && r.patch.trim()) {
       gotPatch = true;
-      for (const p of patchPaths(r.patch)) changedPaths.add(p);
-      if (opts.dry) { process.stdout.write(r.patch); }
+      if (opts.dry) { process.stdout.write(r.patch); for (const p of patchPaths(r.patch)) changedPaths.add(p); }
       else {
-        const tmp = path.join(os.tmpdir(), 'lyngo-' + Date.now() + '.patch');
-        fs.writeFileSync(tmp, r.patch);
-        try { git(['apply', '--whitespace=nowarn', tmp]); }
-        catch (e) { fail('the patch did not apply (' + (e.stderr || '').toString().trim() + '); it is at ' + tmp); }
-        fs.unlinkSync(tmp);
-        patched = true;
+        const a = applyPatch(r.patch);
+        for (const p of a.applied) changedPaths.add(p);
+        if (a.applied.length) patched = true;
+        if (a.split || a.failed.length) {
+          say(`  ${opts.all ? `batch ${batch}: ` : ''}the patch did not apply as a whole; each file alone:`);
+          for (const p of a.applied) say(`    applied: ${p}`);
+          for (const f of a.failed) say(`    failed: ${f.path} (${f.reason})`);
+        }
+        for (const f of a.failed) { failed.push(f); failedPaths.add(f.path); }
       }
     }
     for (const f of r.report?.files || []) if (f.wrapped?.length) report.files.push(f);
@@ -939,8 +1006,9 @@ async function localize(opts) {
       say(`  batch ${batch}: ${done}/${total} files, ${got} string${got === 1 ? '' : 's'} localized`);
     }
   }
-  // Recorded after the patch, so the hook's own changes never count as new edits.
-  if (statePath) fs.writeFileSync(statePath, JSON.stringify(Object.fromEntries(changed.map((p) => [p, sha1(p)]))) + '\n');
+  saveHookState();
+  // A file whose block did not apply localized nothing.
+  report.files = report.files.filter((f) => !failedPaths.has(f.path));
   const wrapped = report.files.reduce((n, f) => n + f.wrapped.length, 0);
   say(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.`);
   for (const f of report.files) say(`  ${f.path}: ${f.wrapped.slice(0, 6).map((s) => JSON.stringify(s)).join(', ')}${f.wrapped.length > 6 ? ', …' : ''}`);
@@ -963,8 +1031,16 @@ async function localize(opts) {
   for (const note of report.notes) say(`  ${note}`);
   if (!gotPatch) say('  Nothing to change: every string a person reads already goes through an i18n call.');
   for (const line of warningLines(report.warnings)) say(line);
+  for (const p of notUtf8) say(notUtf8Line(p));
+  if (failed.length) {
+    // The blocks that did not apply stay on disk for a look; the run exits 1 (the hook always exits 0).
+    const kept = path.join(os.tmpdir(), `lyngo-failed-${Date.now()}.patch`);
+    fs.writeFileSync(kept, failed.map((f) => f.block).join(''));
+    say(`lyngo: ${failed.length} file${failed.length === 1 ? '' : 's'} not changed, the patch did not apply: ${failed.map((f) => f.path).join(', ')}. The blocks are at ${kept}`);
+    if (!opts.hook) process.exitCode = 1;
+  }
   const wrappedPaths = new Set(report.files.map((f) => f.path));
-  return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length, byLanguage: report.languages, sent: total, patched, lines, changedFiles: editedFiles.length, changedCatalogs: editedCatalogs, moreFiles: editedFiles.filter((p) => !wrappedPaths.has(p)).length, enumLabels: enumParts.length > 0 };
+  return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length, byLanguage: report.languages, sent: total, patched, lines, changedFiles: editedFiles.length, changedCatalogs: editedCatalogs, moreFiles: editedFiles.filter((p) => !wrappedPaths.has(p)).length, enumLabels: enumParts.length > 0, notUtf8: [...notUtf8], failed: failed.map((f) => f.path) };
 }
 
 // ── the Claude Code Stop hook ──────────────────────────────────────────────
@@ -1016,7 +1092,15 @@ async function localizeHook(opts) {
   }
   if (!r) return;
   const n = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
-  if (!r.patched) { hookOut(`Lyngo: checked ${n(r.sent, 'file')}, nothing to localize`); return; }
+  // Files Lyngo did not change: a block that did not apply, or a file that is not UTF-8.
+  const problems = [r.failed.length ? `${n(r.failed.length, 'file')} not changed (the patch did not apply)` : '', r.notUtf8.length ? `${n(r.notUtf8.length, 'file')} left as written (not UTF-8)` : ''].filter(Boolean).join('; ');
+  const tellProblems = problems ? ' Tell the user which files Lyngo did not change and why.' : '';
+  if (!r.patched) {
+    const checked = r.sent ? `checked ${n(r.sent, 'file')}, nothing to localize` : '';
+    if (!problems) { hookOut(`Lyngo: ${checked}`); return; }
+    hookOut(`Lyngo: ${[checked, problems].filter(Boolean).join('; ')}`, clip(r.lines.join('\n'), HOOK_CLIP) + '\n\nLyngo changed no file.' + tellProblems);
+    return;
+  }
   const langs = Object.entries(r.byLanguage)
     .filter(([, l]) => l.translated || l.from_memory || l.flagged.length)
     .map(([code, l]) => `${code}: ${l.translated} translated${l.from_memory ? `, ${l.from_memory} from memory` : ''}${l.flagged.length ? `, ${l.flagged.length} flagged for review` : ''}`);
@@ -1027,14 +1111,16 @@ async function localizeHook(opts) {
     ? `${n(r.wrapped, 'string')} localized in ${n(r.files, 'file')}, ${n(r.added, 'new key')}${r.reused ? `, ${r.reused} reused` : ''}${r.moreFiles ? `, ${r.moreFiles} more ${r.moreFiles === 1 ? 'file' : 'files'} changed${enumMark}` : ''}`
     : `${what} changed${enumMark}${r.added ? `, ${n(r.added, 'new key')}` : ''}`;
   hookOut(
-    `Lyngo: ${head}${langs.length ? '; ' + langs.join('; ') : ''}`,
-    clip(r.lines.join('\n'), HOOK_CLIP) + '\n\nLyngo has already updated these files and the catalogs on disk. Tell the user in one or two sentences what Lyngo changed. Do not edit those files or the catalogs again. If the user checks the page, rebuild the frontend first.',
+    `Lyngo: ${head}${langs.length ? '; ' + langs.join('; ') : ''}${problems ? '; ' + problems : ''}`,
+    clip(r.lines.join('\n'), HOOK_CLIP) + '\n\nLyngo has already updated these files and the catalogs on disk. Tell the user in one or two sentences what Lyngo changed. Do not edit those files or the catalogs again. If the user checks the page, rebuild the frontend first.' + tellProblems,
   );
 }
 
 async function check(file) {
   if (!file) fail('usage: lyngo check <file>');
-  const r = await call('check', { path: file, content: fs.readFileSync(file, 'utf8') });
+  const content = utf8(fs.readFileSync(file));
+  if (content === null) fail(`${file} is not UTF-8; it is not sent, and left as written.`);
+  const r = await call('check', { path: file, content });
   // On a path-key project each string has its own key; else the text is the key.
   const lines = r.key_style === 'path'
     ? Object.entries(r.keys || {}).map(([k, text]) => `${k} => ${JSON.stringify(text)}`)

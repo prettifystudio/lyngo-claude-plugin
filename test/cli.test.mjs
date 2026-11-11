@@ -162,7 +162,7 @@ function handle(req, body) {
   }
   if (key === 'POST /mcp/admin' && body.params.name === 'localize') {
     const text = JSON.stringify({
-      patch: ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', "-export const Hello = () => <p>Hello</p>;", "+export const Hello = () => <p>{t('Hello')}</p>;", ''].join('\n'),
+      patch: state.localizePatch || ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', "-export const Hello = () => <p>Hello</p>;", "+export const Hello = () => <p>{t('Hello')}</p>;", ''].join('\n'),
       report: { files: [{ path: 'resources/js/Hello.tsx', wrapped: ['Hello'] }], primary: { added: ['Hello'], already_there: [] }, languages: { fr: { translated: 1, from_memory: 0, flagged: [] } }, dot_keys: ['auth.missing'], ...(state.localizeReport || {}) },
       deferred: [],
       next: state.localizeNext || 'Apply the patch with git apply, then show the user the report.',
@@ -1525,4 +1525,82 @@ test('localize --hook turns a refusal (426) into its error line with the update 
   assert.equal(out.systemMessage, `Lyngo: ${TOO_OLD.message}`);
   assert.equal(out.hookSpecificOutput.additionalContext, `Lyngo could not localize the changes: ${TOO_OLD.message}. Tell the user, with the fix: update the CLI with ${UPDATE}, then run /lyngo:localize.`);
   assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
+});
+
+// ── 0.2.13: a file that is not UTF-8 is never sent; a patch that fails as a whole applies file by file ──
+
+const LATIN1 = Buffer.from('export const Cafe = () => <p>Caf\xe9</p>;\n', 'latin1');
+function latin1Repo() {
+  const repo = helloRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Cafe.tsx'), LATIN1);
+  return repo;
+}
+
+test('localize never sends a file that is not UTF-8 and names it; the hook records it and does not name it again', async () => {
+  loggedIn();
+  const repo = latin1Repo();
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(localizeCalls()[0].body.params.arguments.files.map((f) => f.path), ['resources/js/Hello.tsx']);
+  assert.match(r.stdout, /\n {2}left as written, not UTF-8: resources\/js\/Cafe\.tsx\n/);
+  assert.deepEqual(fs.readFileSync(path.join(repo, 'resources', 'js', 'Cafe.tsx')), LATIN1);
+
+  // Hello.tsx is patched already: the hook sends it again (no state yet), with nothing left to change.
+  reset({ localizeNothing: true });
+  const h = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(h.code, 0, h.out);
+  assert.equal(JSON.parse(h.stdout).systemMessage, 'Lyngo: checked 1 file, nothing to localize; 1 file left as written (not UTF-8)');
+  assert.match(JSON.parse(h.stdout).hookSpecificOutput.additionalContext, /left as written, not UTF-8: resources\/js\/Cafe\.tsx/);
+  assert.ok(Object.keys(JSON.parse(fs.readFileSync(hookState(repo), 'utf8'))).includes('resources/js/Cafe.tsx'));
+  reset();
+  const again = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(again.code, 0, again.out);
+  assert.equal(again.stdout, '');
+  assert.equal(localizeCalls().length, 0);
+});
+
+test('localize with only files that are not UTF-8 calls nothing; check refuses one', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Cafe.tsx'), LATIN1);
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(localizeCalls().length, 0);
+  assert.match(r.stdout, /nothing sent; 1 file is not UTF-8\.\n {2}left as written, not UTF-8: resources\/js\/Cafe\.tsx/);
+  const c = await run(['check', 'resources/js/Cafe.tsx'], { cwd: repo });
+  assert.equal(c.code, 1);
+  assert.match(c.stderr, /resources\/js\/Cafe\.tsx is not UTF-8; it is not sent, and left as written\./);
+  assert.equal(mcpCalls().filter((x) => x.body.params.name === 'check').length, 0);
+});
+
+const TWO_BLOCKS = [
+  'diff --git a/resources/js/app.ts b/resources/js/app.ts', '--- a/resources/js/app.ts', '+++ b/resources/js/app.ts', '@@ -1 +1 @@', "-import './not-what-is-there';", "+import './bootstrap.js';",
+  'diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', '-export const Hello = () => <p>Hello</p>;', "+export const Hello = () => <p>{t('Hello')}</p>;",
+  '',
+].join('\n');
+
+test('a patch that does not apply as a whole applies file by file: the good file changes, the failed one is named with git\'s reason, exit 1', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ localizePatch: TWO_BLOCKS });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 1, r.out);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'app.ts'), 'utf8'), "import './bootstrap';\n");
+  assert.match(r.stdout, /the patch did not apply as a whole; each file alone:\n {4}applied: resources\/js\/Hello\.tsx\n {4}failed: resources\/js\/app\.ts \(patch failed: resources\/js\/app\.ts:1; resources\/js\/app\.ts: patch does not apply\)/);
+  assert.match(r.stdout, /1 file not changed, the patch did not apply: resources\/js\/app\.ts\. The blocks are at /);
+  assert.match(r.stdout, /files changed: 1\n/);
+});
+
+test('localize --hook records only the files that applied, so a failed one goes again at the next stop; it exits 0', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'app.ts'), "import './bootstrap';\nimport './echo';\n");
+  reset({ localizePatch: TWO_BLOCKS });
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  const out = JSON.parse(r.stdout);
+  assert.match(out.systemMessage, /; 1 file not changed \(the patch did not apply\)$/);
+  assert.match(out.hookSpecificOutput.additionalContext, /failed: resources\/js\/app\.ts/);
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(hookState(repo), 'utf8'))), ['resources/js/Hello.tsx']);
 });
