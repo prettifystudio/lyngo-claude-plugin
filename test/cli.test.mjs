@@ -1529,7 +1529,8 @@ test('localize --hook turns a refusal (426) into its error line with the update 
 
 // ── 0.2.13: a file that is not UTF-8 is never sent; a patch that fails as a whole applies file by file ──
 
-const LATIN1 = Buffer.from('export const Cafe = () => <p>Caf\xe9</p>;\n', 'latin1');
+// Not UTF-8, and not Windows-1252 text either (0x81 is unassigned there): never sent (0.2.14 converts Windows-1252).
+const LATIN1 = Buffer.concat([Buffer.from('export const Cafe = () => <p>Caf'), Buffer.from([0xe9, 0x81]), Buffer.from('</p>;\n')]);
 function latin1Repo() {
   const repo = helloRepo();
   fs.writeFileSync(path.join(repo, 'resources', 'js', 'Cafe.tsx'), LATIN1);
@@ -1603,4 +1604,74 @@ test('localize --hook records only the files that applied, so a failed one goes 
   assert.match(out.systemMessage, /; 1 file not changed \(the patch did not apply\)$/);
   assert.match(out.hookSpecificOutput.additionalContext, /failed: resources\/js\/app\.ts/);
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(hookState(repo), 'utf8'))), ['resources/js/Hello.tsx']);
+});
+
+// ── 0.2.14: Windows-1252 becomes UTF-8; submodules are localized and named; Laravel lang files are named ──
+
+test('localize converts a Windows-1252 file to UTF-8 on disk, sends it and names it; its charset declaration follows', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  fs.mkdirSync(path.join(repo, 'resources', 'views'), { recursive: true });
+  const cafe = path.join(repo, 'resources', 'views', 'cafe.blade.php');
+  fs.writeFileSync(cafe, Buffer.from('<meta charset="ISO-8859-1"><p>Caf\xe9 \x80 d\xe9j\xe0 vu</p>\n', 'latin1'));
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const want = '<meta charset="UTF-8"><p>Café € déjà vu</p>\n';
+  assert.equal(fs.readFileSync(cafe, 'utf8'), want);
+  assert.equal(localizeCalls()[0].body.params.arguments.files.find((f) => f.path === 'resources/views/cafe.blade.php').content, want);
+  assert.match(r.stdout, /\n {2}converted to UTF-8 \(was Windows-1252\): resources\/views\/cafe\.blade\.php\n/);
+  assert.doesNotMatch(r.stdout, /not UTF-8/);
+});
+
+test('localize --dry converts nothing on disk', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const bytes = Buffer.from('export const Cafe = () => <p>Caf\xe9</p>;\n', 'latin1');
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Cafe.tsx'), bytes);
+  const r = await run(['localize', '--dry'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(fs.readFileSync(path.join(repo, 'resources', 'js', 'Cafe.tsx')), bytes);
+  assert.match(r.stdout, /left as written, not UTF-8: resources\/js\/Cafe\.tsx/);
+});
+
+function submoduleRepo() {
+  const repo = makeRepo();
+  const ui = path.join(scratch, 'ui');
+  fs.mkdirSync(path.join(ui, 'components'), { recursive: true });
+  g(ui, 'init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(ui, 'components', 'banner.blade.php'), '<p>Hello there</p>\n');
+  g(ui, 'add', '.');
+  g(ui, 'commit', '-q', '-m', 'ui');
+  g(repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', ui, 'packages/ui');
+  g(repo, 'commit', '-q', '-m', 'ui');
+  return repo;
+}
+const BANNER_PATCH = ['diff --git a/packages/ui/components/banner.blade.php b/packages/ui/components/banner.blade.php', '--- a/packages/ui/components/banner.blade.php', '+++ b/packages/ui/components/banner.blade.php', '@@ -1 +1 @@', '-<p>Hello there</p>', "+<p>{{ __('Hello there') }}</p>", ''].join('\n');
+
+test('localize --all sends the files of a submodule, patches them in place and names the submodule; a later run sends its changed files', async () => {
+  loggedIn();
+  const repo = submoduleRepo();
+  reset({ localizePatch: BANNER_PATCH });
+  const r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const sel = calls.find((c) => c.path === '/mcp/admin' && c.body.params.name === 'select_files');
+  assert.ok(sel.body.params.arguments.paths.includes('packages/ui/components/banner.blade.php'), JSON.stringify(sel.body.params.arguments.paths));
+  assert.equal(fs.readFileSync(path.join(repo, 'packages', 'ui', 'components', 'banner.blade.php'), 'utf8'), "<p>{{ __('Hello there') }}</p>\n");
+  assert.match(r.stdout, /\n {2}packages\/ui is a submodule: commit it there too\n/);
+
+  // The submodule's change is a changed file of the working tree for the next run (and the hook).
+  reset({ localizeNothing: true });
+  const again = await run(['localize'], { cwd: repo });
+  assert.equal(again.code, 0, again.out);
+  assert.deepEqual(localizeCalls()[0].body.params.arguments.files.map((f) => f.path), ['packages/ui/components/banner.blade.php']);
+  assert.doesNotMatch(again.stdout, /is a submodule/);
+});
+
+test('localize names the Laravel lang files the server added', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ localizeReport: { laravel_lang: ['lang/fr/validation.php', 'lang/fr/auth.php'] } });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /\n {2}Laravel lang files added: lang\/fr\/validation\.php, lang\/fr\/auth\.php\n/);
 });

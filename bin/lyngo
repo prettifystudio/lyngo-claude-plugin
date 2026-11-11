@@ -414,6 +414,52 @@ function readIfFile(p, notUtf8) {
 }
 const notUtf8Line = (p) => `  left as written, not UTF-8: ${p}`;
 
+// Windows-1252 text (Latin-1 is its subset) becomes UTF-8 on disk before it is
+// sent, and is named: the server reads UTF-8 only (lyngo-gaps cafe.blade.php,
+// 2026-11-11). Bytes that are not such text (Windows-1252's five unassigned
+// positions, control bytes no text holds) stay as written, as before.
+// 0x80-0x9F as Windows-1252 maps them; null where the code page has nothing.
+const CP1252_HIGH = [0x20AC, null, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, null, 0x017D, null,
+  null, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, null, 0x017E, 0x0178];
+function fromWindows1252(bytes) {
+  let out = '';
+  for (const b of bytes) {
+    if (b <= 0x08 || (b >= 0x0E && b <= 0x1A) || (b >= 0x1C && b <= 0x1F)) return null;
+    if (b >= 0x80 && b <= 0x9F) {
+      const cp = CP1252_HIGH[b - 0x80];
+      if (cp === null) return null;
+      out += String.fromCodePoint(cp);
+    } else out += String.fromCharCode(b);
+  }
+  return declareUtf8(out);
+}
+// A converted file's own encoding declarations say UTF-8 too (<meta charset>, http-equiv, <?xml encoding>), as the server's Utf8Content does.
+const LEGACY_CHARSET = '(?:iso-?8859-1|iso_8859-1|latin-?1|windows-1252|cp1252)';
+function declareUtf8(text) {
+  return text
+    .replace(new RegExp(`(<meta\\b[^>]*?\\bcharset\\s*=\\s*["']?)${LEGACY_CHARSET}(?=["'\\s;>/])`, 'gi'), '$1UTF-8')
+    .replace(new RegExp(`(<\\?xml\\b[^>]*?\\bencoding\\s*=\\s*["'])${LEGACY_CHARSET}(?=["'])`, 'gi'), '$1UTF-8');
+}
+// Converts the file on disk when it is Windows-1252 text that is not UTF-8; true when it did.
+function convertToUtf8(p) {
+  let bytes;
+  try { if (!fs.statSync(p).isFile()) return false; bytes = fs.readFileSync(p); } catch { return false; }
+  if (utf8(bytes) !== null) return false;
+  const text = fromWindows1252(bytes);
+  if (text === null) return false;
+  fs.writeFileSync(p, text);
+  return true;
+}
+const convertedLine = (p) => `  converted to UTF-8 (was Windows-1252): ${p}`;
+
+// The submodules checked out in this working tree, by path from the top. Their
+// files are localized like the app's own, into the app's catalogs; each one
+// changed is named, to be committed in its own repository too (lyngo-gaps packages/ui).
+function submodules() {
+  return (gitTry(['submodule', 'status', '--recursive']) || '').split('\n').map((l) => l.match(/^[ +U][0-9a-f]+ (.+?)(?: \(.*\))?$/)).filter(Boolean).map((m) => m[1]);
+}
+const submoduleOf = (p, subs) => subs.filter((s) => p.startsWith(s + '/')).sort((a, b) => b.length - a.length)[0] || null;
+
 // The package manager install after the setup patch: without it Vite cannot
 // resolve the new imports and the page goes blank (vito, Inertia React). Run as a
 // program and arguments, never a shell string, and only a known manager.
@@ -788,12 +834,15 @@ async function onboard(opts) {
 // ── localize, check, status ────────────────────────────────────────────────
 
 function changedFiles(top) {
-  const lines = git(['status', '--porcelain', '--untracked-files=all']).split('\n').filter(Boolean);
   const out = new Set();
-  for (const l of lines) {
-    const p = l.slice(3).trim().replace(/^"|"$/g, '');
-    const rel = p.includes(' -> ') ? p.split(' -> ')[1] : p;
-    if (SRC.test(rel) && !SKIP.test(rel) && fs.existsSync(path.join(top, rel))) out.add(rel);
+  // The working tree's own changes, then each checked-out submodule's.
+  for (const sub of ['', ...submodules()]) {
+    const status = sub ? gitTry(['-C', sub, 'status', '--porcelain', '--untracked-files=all']) : git(['status', '--porcelain', '--untracked-files=all']);
+    for (const l of (status || '').split('\n').filter(Boolean)) {
+      const p = l.slice(3).trim().replace(/^"|"$/g, '');
+      const rel = (sub ? sub + '/' : '') + (p.includes(' -> ') ? p.split(' -> ')[1] : p);
+      if (SRC.test(rel) && !SKIP.test(rel) && fs.existsSync(path.join(top, rel))) out.add(rel);
+    }
   }
   return [...out].sort();
 }
@@ -801,7 +850,8 @@ function changedFiles(top) {
 // Every tracked source file of the repository, as the scan would pick them:
 // a quick local cut by extension and folder, then the server's own rules.
 async function allSourceFiles(top) {
-  const tracked = git(['ls-files', '-z']).split('\0').filter(Boolean).filter((p) => SRC.test(p) && !SKIP.test(p) && fs.existsSync(path.join(top, p)));
+  // The files of checked-out submodules too (packages/ui of lyngo-gaps): the app renders them.
+  const tracked = git(['ls-files', '-z', '--recurse-submodules']).split('\0').filter(Boolean).filter((p) => SRC.test(p) && !SKIP.test(p) && fs.existsSync(path.join(top, p)));
   if (tracked.length === 0) return [];
   try {
     const r = await call('select_files', { paths: tracked });
@@ -898,8 +948,10 @@ async function localize(opts) {
   const changed = files;
   const statePath = opts.hook ? path.resolve(top, git(['rev-parse', '--git-path', 'lyngo-hook.json']).trim()) : null;
   if (statePath) { const seen = parseCatalog(statePath) || {}; files = files.filter((p) => seen[p] !== sha1(p)); }
-  // A file that is not UTF-8 is never sent (readIfFile): it is named and left as written.
+  // A file in Windows-1252 becomes UTF-8 on disk first (not with --dry, which changes nothing).
+  // One that is not UTF-8 after that is never sent (readIfFile): it is named and left as written.
   // The hook state records it, so the next stop does not name it again.
+  const converted = opts.dry ? [] : files.filter((p) => convertToUtf8(p));
   const notUtf8 = new Set();
   files = files.filter((p) => readIfFile(p, notUtf8) !== null);
   // Recorded after the patch, so the hook's own changes never count as new edits;
@@ -910,6 +962,7 @@ async function localize(opts) {
     if (!notUtf8.size) { say(opts.all ? 'lyngo: no source file of this project found in the repository.' : 'lyngo: nothing changed in the working tree.'); return null; }
     say(`lyngo: nothing sent; ${notUtf8.size} file${notUtf8.size === 1 ? ' is' : 's are'} not UTF-8.`);
     for (const p of notUtf8) say(notUtf8Line(p));
+    for (const p of converted) say(convertedLine(p));
     saveHookState();
     return { wrapped: 0, files: 0, added: 0, reused: 0, languages: 0, byLanguage: {}, sent: 0, patched: false, lines, changedFiles: 0, changedCatalogs: 0, moreFiles: 0, enumLabels: false, notUtf8: [...notUtf8], failed: [] };
   }
@@ -942,7 +995,7 @@ async function localize(opts) {
   if (opts.all) say(`lyngo: localizing ${total} file${total === 1 ? '' : 's'} in batches; each batch applies before the next.`);
   // Progress while a job runs goes to the terminal; the hook keeps its output to the report.
   const progress = opts.hook ? null : (line) => console.log(line);
-  const report = { files: [], added: [], reused: [], languages: {}, missing: new Set(), skipped: [], untranslated: {}, notes: [], warnings: new Set() };
+  const report = { files: [], added: [], reused: [], languages: {}, missing: new Set(), skipped: [], untranslated: {}, notes: [], warnings: new Set(), laravelLang: [] };
   let batch = 0;
   let patched = false;
   let gotPatch = false; // a patch came back (applied, or printed by --dry)
@@ -994,6 +1047,7 @@ async function localize(opts) {
       if (l.untranslated?.length) (report.untranslated[code] = report.untranslated[code] || []).push(...l.untranslated);
     }
     report.skipped.push(...(r.report?.skipped || []));
+    report.laravelLang.push(...(r.report?.laravel_lang || []));
     for (const w of r.report?.warnings || []) report.warnings.add(String(w));
     for (const [k, v] of Object.entries(r.report?.enum_labels?.counts || {})) if (typeof v === 'number') enumCounts[k] = (enumCounts[k] || 0) + v;
     // What the server says beyond the steps this CLI takes itself (apply, call again).
@@ -1032,6 +1086,11 @@ async function localize(opts) {
   if (!gotPatch) say('  Nothing to change: every string a person reads already goes through an i18n call.');
   for (const line of warningLines(report.warnings)) say(line);
   for (const p of notUtf8) say(notUtf8Line(p));
+  for (const p of converted) say(convertedLine(p));
+  const laravelLang = [...new Set(report.laravelLang)];
+  if (laravelLang.length) say(`  Laravel lang files added: ${laravelLang.slice(0, 6).join(', ')}${laravelLang.length > 6 ? `, and ${laravelLang.length - 6} more` : ''}`);
+  const subs = submodules();
+  for (const sub of [...new Set([...changedPaths].map((p) => submoduleOf(p, subs)).filter(Boolean))].sort()) say(`  ${sub} is a submodule: commit it there too`);
   if (failed.length) {
     // The blocks that did not apply stay on disk for a look; the run exits 1 (the hook always exits 0).
     const kept = path.join(os.tmpdir(), `lyngo-failed-${Date.now()}.patch`);
