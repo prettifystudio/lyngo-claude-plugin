@@ -1712,3 +1712,47 @@ test('the localize summary line ends with the server build, and has none without
   assert.match(r.stdout, /lyngo: 1 string localized in 1 file; 1 new key, 0 reused\.\n/);
   assert.doesNotMatch(r.stdout, /server/);
 });
+
+// ── 0.2.16: the rebuild line after a frontend change, and the detection note of init ──
+
+test('the localize summary ends with the rebuild line when the patch changed a frontend file, with the lockfile\'s package manager', async () => {
+  loggedIn();
+  let r = await run(['localize'], { cwd: helloRepo() });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /\nRebuild your assets to see the changes: npm run build \(or npm run dev\)\.\n$/);
+
+  fs.rmSync(path.join(scratch, 'repo'), { recursive: true, force: true });
+  reset();
+  const repo = helloRepo();
+  fs.writeFileSync(path.join(repo, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n');
+  r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /\nRebuild your assets to see the changes: pnpm run build \(or pnpm run dev\)\.\n$/);
+});
+
+test('no rebuild line when the patch changed only PHP files and catalogs, or with --dry', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'app'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'app', 'Hello.php'), "<?php return 'Hello';\n");
+  reset({ localizePatch: ['diff --git a/app/Hello.php b/app/Hello.php', '--- a/app/Hello.php', '+++ b/app/Hello.php', '@@ -1 +1 @@', "-<?php return 'Hello';", "+<?php return __('Hello');", 'diff --git a/lang/fr.json b/lang/fr.json', 'new file mode 100644', '--- /dev/null', '+++ b/lang/fr.json', '@@ -0,0 +1 @@', '+{"Hello": "Bonjour"}', ''].join('\n'), localizeReport: { files: [{ path: 'app/Hello.php', wrapped: ['Hello'] }] } });
+  let r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /files changed: 1, catalogs changed: 1/);
+  assert.doesNotMatch(r.stdout, /Rebuild/);
+
+  fs.rmSync(path.join(scratch, 'repo'), { recursive: true, force: true });
+  reset();
+  r = await run(['localize', '--dry'], { cwd: helloRepo() });
+  assert.equal(r.code, 0, r.out);
+  assert.doesNotMatch(r.stdout, /Rebuild/);
+});
+
+test('init prints the server\'s detection note: the session is the only source, confirm the order with the user, the file to change', async () => {
+  loggedIn();
+  const note = 'Language detection: the language switcher stores the choice in the session, and app/Http/Middleware/SetLocale.php reads it from there. No other source is on. Confirm the detection order with the user: their saved language (a users.locale column), the browser language (Accept-Language), a language in the URL. Change the order in app/Http/Middleware/SetLocale.php.';
+  reset({ scaffold: () => [200, { patch: SCAFFOLD_PATCH, files: ['package.json', 'resources/js/i18n.ts'], install_command: null, notes: [note] }] });
+  const r = await run(['init', '--yes', '--languages', 'fr'], { cwd: makeRepo() });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(r.stdout.includes('Scaffolding applied:\n  package.json\n  resources/js/i18n.ts\n  ' + note + '\n'), r.stdout);
+});

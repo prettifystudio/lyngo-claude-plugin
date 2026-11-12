@@ -938,6 +938,11 @@ function enumLabelParts(counts) {
   return ENUM_PARTS.filter(([k]) => counts[k] > 0).map(([k, one, many]) => `${counts[k]} ${counts[k] === 1 ? one : many}`);
 }
 
+// The files a frontend build bundles, and the package manager the lockfile at the top names (npm when none).
+const FRONTEND_FILE = /\.(?:jsx?|tsx?|vue|svelte)$/;
+const LOCKFILES = [['pnpm-lock.yaml', 'pnpm'], ['yarn.lock', 'yarn'], ['bun.lock', 'bun'], ['bun.lockb', 'bun']];
+const packageManager = () => (LOCKFILES.find(([f]) => fs.existsSync(f)) || [null, 'npm'])[1];
+
 async function localize(opts) {
   const top = root();
   process.chdir(top);
@@ -1089,6 +1094,8 @@ async function localize(opts) {
   for (const sk of report.skipped) say(`  skipped ${sk.path}: ${sk.reason}`);
   for (const note of report.notes) say(`  ${note}`);
   if (!gotPatch) say('  Nothing to change: every string a person reads already goes through an i18n call.');
+  // Vite serves the old bundle until the assets are built again, after the summary and before the warnings (not with --dry, which changes nothing).
+  if (!opts.dry && editedFiles.some((p) => FRONTEND_FILE.test(p))) say(`Rebuild your assets to see the changes: ${packageManager()} run build (or ${packageManager()} run dev).`);
   for (const line of warningLines(report.warnings)) say(line);
   for (const p of notUtf8) say(notUtf8Line(p));
   for (const p of converted) say(convertedLine(p));
