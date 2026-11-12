@@ -90,6 +90,8 @@ function scrub(text, t) { return t ? String(text).split(t).join(prefixOf(t)) : S
 // Every request names this version in User-Agent. The server answers with the
 // newest CLI (X-Lyngo-Cli-Latest) and the oldest one it accepts
 // (X-Lyngo-Cli-Minimum), and refuses a CLI below that one with HTTP 426.
+// X-Lyngo-Server names the server build (its short commit) that answered, so
+// a bug report can say which server decided a result.
 
 function version() {
   try { return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version || '0.1.0'; } catch { return '0.1.0'; }
@@ -101,6 +103,7 @@ const NOTICE_FILE = path.join(TOKEN_DIR, 'update-notice.json');
 const DAY_MS = 24 * 60 * 60 * 1000;
 let latestSeen = null; // X-Lyngo-Cli-Latest of the last answer
 let refused = false; // a 426 already says to update
+let serverSeen = null; // X-Lyngo-Server of the last answer: the server's short commit
 
 // Numbers, not strings: 0.2.10 is newer than 0.2.9. A pre-release tag is ignored.
 function compareVersions(a, b) {
@@ -172,6 +175,8 @@ async function request(method, url, { body, auth = true, accept = 'application/j
   }
   const latest = res.headers.get('x-lyngo-cli-latest');
   if (latest) latestSeen = latest.trim();
+  const build = (res.headers.get('x-lyngo-server') || '').trim();
+  if (/^[0-9a-f]{7,40}$/i.test(build)) serverSeen = build;
   if (res.status === 426) {
     refused = true;
     const minimum = res.headers.get('x-lyngo-cli-minimum');
@@ -1064,7 +1069,7 @@ async function localize(opts) {
   // A file whose block did not apply localized nothing.
   report.files = report.files.filter((f) => !failedPaths.has(f.path));
   const wrapped = report.files.reduce((n, f) => n + f.wrapped.length, 0);
-  say(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.`);
+  say(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.${serverSeen ? ` (server ${serverSeen})` : ''}`);
   for (const f of report.files) say(`  ${f.path}: ${f.wrapped.slice(0, 6).map((s) => JSON.stringify(s)).join(', ')}${f.wrapped.length > 6 ? ', …' : ''}`);
   // Every file the patch changed, the enum-label edits too (they wrap no string); the catalogs apart.
   const isCatalog = (p) => folders.some((f) => p.startsWith(f + '/'));
@@ -1195,6 +1200,7 @@ async function status() {
   console.log(`${r.project}: ${r.i18n?.framework} / ${r.i18n?.library} / ${r.i18n?.function}(), catalogs in ${r.i18n?.catalog_folder}`);
   console.log(`languages: ${r.primary_language} -> ${(r.languages || []).join(', ')}`);
   if (r.refused_strings?.length) console.log(`refused (never localize): ${r.refused_strings.slice(0, 8).map((s) => JSON.stringify(s)).join(', ')}`);
+  if (serverSeen) console.log(`server: ${serverSeen}`);
 }
 
 // ── entry ──────────────────────────────────────────────────────────────────

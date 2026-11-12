@@ -1675,3 +1675,40 @@ test('localize names the Laravel lang files the server added', async () => {
   assert.equal(r.code, 0, r.out);
   assert.match(r.stdout, /\n {2}Laravel lang files added: lang\/fr\/validation\.php, lang\/fr\/auth\.php\n/);
 });
+
+// ── 0.2.15: the server build (X-Lyngo-Server) in status and in the localize summary ──
+
+test('status prints the server build from X-Lyngo-Server, and nothing without the header', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  reset({ headers: { 'X-Lyngo-Server': 'eff6d5f' } });
+  let r = await run(['status'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /\nserver: eff6d5f\n$/);
+
+  reset();
+  r = await run(['status'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.doesNotMatch(r.stdout, /server/);
+
+  // A header that is not a commit is never printed.
+  reset({ headers: { 'X-Lyngo-Server': 'main; echo hi' } });
+  r = await run(['status'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.doesNotMatch(r.stdout, /server/);
+});
+
+test('the localize summary line ends with the server build, and has none without the header', async () => {
+  loggedIn();
+  reset({ headers: { 'X-Lyngo-Server': 'eff6d5f' } });
+  let r = await run(['localize'], { cwd: helloRepo() });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /lyngo: 1 string localized in 1 file; 1 new key, 0 reused\. \(server eff6d5f\)\n/);
+
+  fs.rmSync(path.join(scratch, 'repo'), { recursive: true, force: true });
+  reset();
+  r = await run(['localize'], { cwd: helloRepo() });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /lyngo: 1 string localized in 1 file; 1 new key, 0 reused\.\n/);
+  assert.doesNotMatch(r.stdout, /server/);
+});
