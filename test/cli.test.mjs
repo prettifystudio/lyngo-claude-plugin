@@ -415,6 +415,17 @@ test('init on a found project sets everything up, and a second run changes nothi
   assert.equal(fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8').split('\n').filter((l) => l === '.claude/settings.local.json').length, 1);
 });
 
+test('init prints the server notes when there is nothing to scaffold, the project brief among them', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude();
+  const brief = 'Project brief: A planner for students. … (edit it in the project settings)';
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [], notes: [brief] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /Scaffolding: nothing to add\.\n {2}Project brief: A planner for students\. … \(edit it in the project settings\)\n/);
+});
+
 const scaffoldWith = (install_command) => () => [200, { patch: SCAFFOLD_PATCH, files: ['package.json', 'resources/js/i18n.ts'], install_command, notes: [] }];
 
 test('init runs the install command the server names in the repository root, after the patch', async () => {

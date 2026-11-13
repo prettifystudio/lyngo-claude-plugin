@@ -510,7 +510,8 @@ async function scaffold(project, opts = {}) {
       continue;
     }
     const d = expect(r, 200);
-    if (!d.patch || !d.patch.trim()) { console.log('Scaffolding: nothing to add.'); return; }
+    // The notes are read with or without a patch: the project brief init built is one of them.
+    if (!d.patch || !d.patch.trim()) { console.log('Scaffolding: nothing to add.'); for (const n of d.notes || []) console.log('  ' + n); return; }
     const tmp = path.join(os.tmpdir(), `lyngo-scaffold-${Date.now()}.patch`);
     fs.writeFileSync(tmp, d.patch);
     try {
