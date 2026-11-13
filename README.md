@@ -44,7 +44,10 @@ lyngo init           # project, i18n setup, languages, agent hook
 6. When Claude Code is installed: registers the Lyngo MCP server for this
    repository in Claude Code's local scope (stored in your home folder, never in
    the repository), and adds one Stop hook to `.claude/settings.local.json` that
-   runs `lyngo localize --hook` when your agent finishes a task.
+   runs `lyngo localize --hook` when your agent finishes a task. A Claude Code
+   session that is open does not load them: when init adds them, it says to
+   restart Claude Code in the repository. Exit, then run `claude --continue` to
+   keep the conversation.
 
 Run it again at any time: it prints the state and changes nothing that is
 already set up.

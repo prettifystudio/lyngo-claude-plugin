@@ -18,7 +18,10 @@ run it in the background and read its output. When it prints a GitHub link,
 tell the user that GitHub opened in their browser and that init continues by
 itself once they add the repository. Do not tell them to run init again, unless
 the 9-minute wait ran out. In CI or with `--no-wait`, exit code 3 means a
-person must install the GitHub App first.
+person must install the GitHub App first. When it says to restart Claude Code,
+tell the user: this session does not load the new Stop hook and MCP server.
+They exit, then start Claude Code again in this repository with
+`claude --continue` to keep the conversation.
 
 ## When
 
@@ -40,7 +43,9 @@ person must install the GitHub App first.
    hook that `lyngo init` installs is in `.claude/settings.local.json`: it runs
    `lyngo localize --hook` when your turn ends and hands you its report as
    "Stop hook feedback". Then tell the user in one or two sentences what Lyngo
-   changed, and do not edit those files or the catalogs again.
+   changed, and do not edit those files or the catalogs again. When
+   `lyngo init` added the hook in this session, the hook does not run until the
+   user restarts Claude Code; until then, do as when there is no hook.
    **When the user asks to localize or translate**, or there is no hook: run
    `lyngo localize` from the repository root (if `lyngo` is not on PATH:
    `node "${CLAUDE_PLUGIN_ROOT}/bin/lyngo" localize`) and show the user its

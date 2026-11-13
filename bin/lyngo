@@ -535,11 +535,13 @@ function setUpClaudeCode(top, remote) {
   if (!claude) { console.log('Claude Code not found: no agent setup. Run lyngo localize before you commit.'); return; }
   const t = readToken();
   const run = (args) => execFileSync(claude, args, { cwd: top, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  try { run(['mcp', 'remove', 'lyngo', '-s', 'local']); } catch { /* not registered yet */ }
+  let mcpNew = false;
+  try { run(['mcp', 'remove', 'lyngo', '-s', 'local']); } catch { mcpNew = true; /* not registered yet */ }
   try {
     run(['mcp', 'add', '--transport', 'http', '--scope', 'local', 'lyngo', AGENT_MCP_URL,
       '-H', 'Authorization: Bearer ' + t, '-H', 'X-Lyngo-Remote: ' + remote]);
   } catch (e) {
+    mcpNew = false;
     console.error('lyngo: could not register the Lyngo MCP server in Claude Code (' + scrub(((e.stderr || e.message || '') + '').trim(), t) + ').');
     process.exitCode = 1;
   }
@@ -582,6 +584,9 @@ function setUpClaudeCode(top, remote) {
     }
   }
   console.log(`Claude Code: the lyngo MCP server is registered for this repository, and the Stop hook ${has ? 'was already' : 'is'} in .claude/settings.local.json.`);
+  // A Claude Code session that is open does not load a new hook or MCP server
+  // (a session ran 25 hours after init with no Stop hook run, 2026-11-13).
+  if (!has || mcpNew) console.log('Restart Claude Code in this repository so that it loads the Stop hook and the MCP server: exit, then run claude --continue to keep the conversation.');
   // The slash commands (/lyngo:localize, /lyngo:init, /lyngo:status) come
   // from the plugin; say how to get it when it is not installed yet.
   let installed = false;

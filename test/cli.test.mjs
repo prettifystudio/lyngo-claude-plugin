@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 const HOOK = `if command -v lyngo >/dev/null 2>&1; then lyngo localize --hook; else echo '{"systemMessage":"Lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"}'; fi`;
 const HOOK_024 = 'if command -v lyngo >/dev/null 2>&1; then lyngo localize 2>&1 | tail -20; else echo "lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"; fi';
+const RESTART = 'Restart Claude Code in this repository so that it loads the Stop hook and the MCP server: exit, then run claude --continue to keep the conversation.';
 const BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'lyngo');
 const TOKEN = 'lyn_' + 'Z'.repeat(40);
 const REMOTE = 'git@github.com:acme/shop.git';
@@ -237,11 +238,13 @@ function loggedIn() {
   fs.writeFileSync(path.join(dir, 'token'), TOKEN + '\n', { mode: 0o600 });
 }
 
-function stubClaude() {
+// `notRegistered`: `claude mcp remove` fails, as when no lyngo MCP server is registered yet.
+function stubClaude({ notRegistered = false } = {}) {
   const dir = path.join(scratch, 'stub');
   fs.mkdirSync(dir, { recursive: true });
   const log = path.join(scratch, 'claude.log');
-  fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a" >> "${log}"; done\nprintf -- '---\\n' >> "${log}"\n`, { mode: 0o755 });
+  const fail = notRegistered ? `if [ "$1 $2" = "mcp remove" ]; then exit 1; fi\n` : '';
+  fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a" >> "${log}"; done\nprintf -- '---\\n' >> "${log}"\n${fail}`, { mode: 0o755 });
   return { dir, log };
 }
 
@@ -369,6 +372,7 @@ test('init on a found project sets everything up, and a second run changes nothi
   assert.match(r.stdout, /Restart your dev server so Vite picks up the new packages\./);
   assert.match(r.stdout, /Done\. Build as usual; lyngo localize runs when your agent finishes, or run it yourself before committing\./);
   assert.match(r.stdout, /Slash commands for Claude Code \(\/lyngo:localize, \/lyngo:init, \/lyngo:status\): claude plugin marketplace add prettifystudio\/lyngo-claude-plugin && claude plugin install lyngo@lyngo/);
+  assert.ok(r.stdout.includes(RESTART), 'a new hook: an open session must restart to load it');
   assert.ok(!r.out.includes(TOKEN), 'the token never reaches the terminal');
 
   // Every call inside the repository names it.
@@ -404,6 +408,7 @@ test('init on a found project sets everything up, and a second run changes nothi
   assert.match(again.stdout, /Languages: en -> fr/);
   assert.match(again.stdout, /Scaffolding: nothing to add\./);
   assert.match(again.stdout, /Stop hook was already in/);
+  assert.ok(!again.stdout.includes('Restart Claude Code'), 'nothing new: no restart');
   assert.equal(calls.filter((c) => c.method === 'PATCH').length, 0);
   const settings2 = JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8'));
   assert.equal(settings2.hooks.Stop.length, 1);
@@ -466,6 +471,19 @@ test('init exits non-zero with the command to run when the package manager is no
   const r = await run(['init', '--yes', '--languages', 'fr'], { cwd: repo, env: { PATH: [...new Set(dirs)].join(path.delimiter) } });
   assert.equal(r.code, 1, r.out);
   assert.match(r.stderr, /lyngo: bun is not installed, so the new packages are not\. Run bun install in .+ before you start the dev server\./);
+});
+
+test('init says to restart Claude Code when it registers the MCP server new, even with the hook already there', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude({ notRegistered: true });
+  fs.mkdirSync(path.join(repo, '.claude'));
+  fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: HOOK }] }] } }));
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /Stop hook was already in/);
+  assert.ok(r.stdout.includes(RESTART), r.stdout);
 });
 
 test('init keeps an existing settings file and adds the hook beside it', async () => {
