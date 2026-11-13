@@ -655,6 +655,22 @@ function warningLines(warnings) {
   return out;
 }
 
+// The values the verifier flagged: one line each, where the code shows the key
+// (file:line, when the server knows it) and why, in a few words. Capped too.
+// An older server sends the keys alone.
+const FLAGGED_SHOWN = 10;
+function flaggedLines(flagged) {
+  const list = [...flagged];
+  const short = (k) => (k.length > 70 ? k.slice(0, 69) + '…' : k);
+  const out = list.slice(0, FLAGGED_SHOWN).map((f) => {
+    if (typeof f !== 'object' || f === null) return `    ${JSON.stringify(short(String(f)))}`;
+    const place = f.file ? `${f.file}${f.line ? `:${f.line}` : ''} ` : '';
+    return `    ${place}${JSON.stringify(short(String(f.key)))}${f.reason ? `: ${f.reason}` : ''}`;
+  });
+  if (list.length > FLAGGED_SHOWN) out.push(`    … and ${list.length - FLAGGED_SHOWN} more`);
+  return out;
+}
+
 // ── translate: fill a language's catalog from the primary one ─────────────
 async function translate(opts) {
   const top = root();
@@ -698,8 +714,9 @@ async function translateLanguage(code, project) {
     for (const w of (r.report && r.report.warnings) || []) warnings.add(String(w));
     if (process.stdout.isTTY) process.stdout.write(`\r${code}: ${Math.min(i + 100, missing.length)}/${missing.length}`);
   }
-  const flaggedText = flagged.length ? `; ${flagged.length} flagged for review: ${flagged.slice(0, 3).map((x) => JSON.stringify(x.key || x)).join(', ')}` : '';
+  const flaggedText = flagged.length ? `; ${flagged.length} flagged for review` : '';
   console.log(`${process.stdout.isTTY ? '\r' : ''}${code}: ${translated} translated, ${memory} from memory${flaggedText} -> ${targetPath}`);
+  for (const line of flaggedLines(flagged)) console.log(line);
   for (const line of warningLines(warnings)) console.log(line);
 }
 
@@ -1105,8 +1122,9 @@ async function localize(opts) {
   if (enumParts.length) say(`  enum labels: ${enumParts.join(', ')}`);
   if (opts['no-translate'] || (status.translate_on_localize === false && !Object.keys(report.languages).length)) say('  catalogs: not translated (keys only).');
   for (const [code, l] of Object.entries(report.languages)) {
-    const flagged = l.flagged.length ? `; ${l.flagged.length} flagged for review: ${l.flagged.slice(0, 3).map((x) => JSON.stringify(x.key || x)).join(', ')}` : '';
+    const flagged = l.flagged.length ? `; ${l.flagged.length} flagged for review` : '';
     say(`  ${code}: ${l.translated} translated, ${l.from_memory} from memory${flagged}`);
+    for (const line of flaggedLines(l.flagged)) say(line);
   }
   if (report.missing.size) say(`  path keys no catalog holds: ${[...report.missing].slice(0, 6).map((k) => JSON.stringify(k)).join(', ')}${report.missing.size > 6 ? ', …' : ''}`);
   for (const [code, keys] of Object.entries(report.untranslated)) say(`  ${code}: ${keys.length} key${keys.length === 1 ? '' : 's'} not translated yet (${keys.slice(0, 3).map((k) => JSON.stringify(k)).join(', ')}${keys.length > 3 ? ', …' : ''}): run lyngo translate ${code}`);

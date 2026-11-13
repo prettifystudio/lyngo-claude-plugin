@@ -1128,6 +1128,33 @@ test('localize prints what the server skipped, the keys a language did not get a
   assert.doesNotMatch(r.stdout, /Apply the patch/);
 });
 
+test('localize prints each flagged key with its file:line and the reason', async () => {
+  loggedIn();
+  const flagged = [
+    { key: 'How do I get a token?', reason: 'untranslated word "token"', file: 'resources/js/pages/canvas.tsx', line: 215 },
+    { key: 'Save', reason: null },
+    'Old server key',
+  ];
+  reset({ jobs: {}, localizeReport: { languages: { fr: { translated: 3, from_memory: 0, flagged } } } });
+  const r = await run(['localize'], { cwd: helloRepo() });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /\n {2}fr: 3 translated, 0 from memory; 3 flagged for review\n/);
+  assert.match(r.stdout, /\n {4}resources\/js\/pages\/canvas\.tsx:215 "How do I get a token\?": untranslated word "token"\n/);
+  assert.match(r.stdout, /\n {4}"Save"\n/);
+  assert.match(r.stdout, /\n {4}"Old server key"\n/);
+});
+
+test('translate prints each flagged key with the reason', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), JSON.stringify({ 'How do I get a token?': 'How do I get a token?' }));
+  reset({ translateReport: { languages: { fr: { translated: 1, from_memory: 0, flagged: [{ key: 'How do I get a token?', reason: 'untranslated word "token"' }] } } } });
+  const t = await run(['translate', 'fr'], { cwd: repo });
+  assert.equal(t.code, 0, t.out);
+  assert.match(t.stdout, /fr: 1 translated, 0 from memory; 1 flagged for review -> lang\/fr\.json\n {4}"How do I get a token\?": untranslated word "token"\n/);
+});
+
 test('localize --dry with jobs ends: each call sends only what the last one deferred', async () => {
   loggedIn();
   const repo = makeRepo();
