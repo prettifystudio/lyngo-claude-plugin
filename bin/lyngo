@@ -329,6 +329,12 @@ function inCI() { const v = (process.env.CI || '').trim(); return v !== '' && v.
 // starts: an agent that reads the output from a file sees the link at once.
 const printNow = (text) => new Promise((resolve) => process.stdout.write(text + '\n', () => resolve()));
 
+// The GitHub wait asks every 2 s, counted from the last answer: the server
+// answers from the repository list (saved by the Setup URL redirect or the
+// webhook) and asks GitHub itself at most every 4 s, so a grant shows within
+// a poll or two, as fast as npm login notices a login (0.2.17; was 5 s).
+const GITHUB_POLL_SECONDS = 2;
+
 async function connectProject(opts, remote, branch) {
   const body = { remote, branch, workspace: opts.workspace };
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -357,7 +363,7 @@ async function connectProject(opts, remote, branch) {
       let connected = false;
       let told = 0;
       while (!connected && Date.now() - start < minutes * 60 * TICK) {
-        await sleep(5);
+        await sleep(GITHUB_POLL_SECONDS);
         const st = expect(await api('GET', '/cli/projects/status?' + q), 200);
         connected = !!st.github_connected;
         const m = Math.floor((Date.now() - start) / (60 * TICK));

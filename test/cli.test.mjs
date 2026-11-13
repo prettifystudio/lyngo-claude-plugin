@@ -199,7 +199,7 @@ before(async () => {
     req.on('data', (c) => { raw += c; });
     req.on('end', () => {
       const body = raw ? JSON.parse(raw) : null;
-      calls.push({ method: req.method, path: new URL(req.url, 'http://x').pathname, url: req.url, headers: req.headers, body });
+      calls.push({ method: req.method, path: new URL(req.url, 'http://x').pathname, url: req.url, headers: req.headers, body, at: Date.now() });
       // state.faults: one entry per request ('reset' drops the connection, a number is that status), the last one repeats.
       const fault = state.faults && next(state.faults);
       if (fault === 'reset') { req.socket.resetAndDestroy(); return; }
@@ -638,6 +638,21 @@ test('init without a terminal gives up after 9 minutes with a clear message and 
   assert.ok(calls.filter((c) => c.path === '/cli/projects/status').length > 2);
   assert.equal(calls.filter((c) => c.path === '/cli/projects').length, 1);
   assert.equal(calls.filter((c) => c.path.endsWith('/detect')).length, 0);
+});
+
+test('init asks for the GitHub status every 2 s while it waits (0.2.17; was 5 s)', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const no = [200, { github_connected: false, project: null }];
+  needsApp([no, no, no, [200, { github_connected: true, project: null }]]);
+  // One tick is 25 ms: a 2 s poll is 50 ms apart, the old 5 s one 125 ms.
+  const r = await run(['init', '--languages', 'en,fr'], { cwd: repo, env: { LYNGO_TICK_MS: '25' } });
+  assert.equal(r.code, 0, r.out);
+  const asked = calls.filter((c) => c.path === '/cli/projects' || c.path === '/cli/projects/status').slice(0, 5);
+  assert.deepEqual(asked.map((c) => c.path), ['/cli/projects', ...Array(4).fill('/cli/projects/status')]);
+  const gaps = asked.slice(1).map((c, i) => c.at - asked[i].at);
+  assert.ok(gaps.every((g) => g >= 45 && g < 120), `gaps ${gaps.join(', ')} ms`);
+  assert.match(r.stdout, /GitHub is connected\.\nCreated shop in workspace Acme\./);
 });
 
 test('init stops a member when GitHub is not connected', async () => {
