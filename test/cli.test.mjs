@@ -129,6 +129,16 @@ function handle(req, body) {
       : { patch: '', report: { files: [], primary: { added: [], already_there: [] }, languages: {}, catalogs_seen: sent }, deferred: [] });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
+  if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeReadAt) {
+    // --all over Hello.tsx and app.ts: the first call patches Hello.tsx and defers app.ts; the second
+    // names Hello.tsx in "needs", read at the blob state.localizeReadAt (needs_sha); a call with context gets no "needs".
+    const { files, context } = body.params.arguments;
+    const first = files.length > 1;
+    const text = JSON.stringify(first
+      ? { patch: ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', '-export const Hello = () => <p>Hello</p>;', "+export const Hello = () => <p>{t('Hello')}</p>;", ''].join('\n'), report: { files: [{ path: files[0].path, wrapped: ['Hello'] }], primary: { added: ['Hello'], already_there: [] }, languages: {} }, deferred: files.slice(1).map((f) => f.path) }
+      : { patch: '', report: { files: [], primary: { added: [], already_there: [] }, languages: {} }, deferred: [], ...(Array.isArray(context) ? {} : { needs: ['resources/js/Hello.tsx'], needs_sha: { 'resources/js/Hello.tsx': state.localizeReadAt } }) });
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeNeeds) {
     // "needs": the first answer names files the server read from GitHub, with a patch
     // that must not be applied; the call with "context" gets the real patch (and "needs" again when state.needsAgain).
@@ -138,7 +148,7 @@ function handle(req, body) {
       patch: ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', '-export const Hello = () => <p>Hello</p>;', `+export const Hello = () => <p>${said}</p>;`, ''].join('\n'),
       report: { files: [{ path: 'resources/js/Hello.tsx', wrapped: ['Hello'] }], primary: { added: ['Hello'], already_there: [] }, languages: {} },
       deferred: [],
-      ...(retry && !state.needsAgain ? {} : { needs: state.localizeNeeds }),
+      ...(retry && !state.needsAgain ? {} : { needs: state.localizeNeeds, ...(state.localizeNeedsSha ? { needs_sha: state.localizeNeedsSha } : {}) }),
     });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
@@ -1310,6 +1320,56 @@ test('localize applies an answer with "needs" when none of the needed files can 
   assert.equal(r.code, 0, r.out);
   assert.equal(localizeCalls().length, 1);
   assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('first answer')}</p>;\n");
+});
+
+// ── 0.2.18: "needs_sha" names the blob the server read; a copy with that blob is not sent again ──
+
+test('localize leaves out a needed file whose blob is the one the server read, and keeps the answer when none is left', async () => {
+  loggedIn();
+  const repo = needsRepo();
+  const enumPath = 'app/Enums/ServerStatus.php';
+  fs.mkdirSync(path.join(repo, 'app', 'Models'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'app', 'Models', 'Server.php'), '<?php class Server {}\n');
+  g(repo, 'add', 'app/Models/Server.php');
+  g(repo, 'commit', '-q', '-m', 'model');
+  const blob = g(repo, 'hash-object', enumPath).trim();
+  reset({ localizeNeeds: [enumPath, 'app/Models/Server.php'], localizeNeedsSha: { [enumPath]: blob, 'app/Models/Server.php': '0'.repeat(40) } });
+  let r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(localizeCalls().map((c) => c.body.params.arguments.context), [undefined, [{ path: 'app/Models/Server.php', content: '<?php class Server {}\n' }]]);
+
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  reset({ localizeNeeds: [enumPath], localizeNeedsSha: { [enumPath]: blob } });
+  r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(localizeCalls().length, 1);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('first answer')}</p>;\n");
+});
+
+test('localize --all compares a file an earlier batch patched by the content it sent, and sends the disk\'s copy only when the server read another', async () => {
+  loggedIn();
+  const hello = 'export const Hello = () => <p>Hello</p>;\n';
+  const allRepo = () => {
+    const repo = makeRepo();
+    fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), hello);
+    g(repo, 'add', '.');
+    g(repo, 'commit', '-q', '-m', 'files');
+    return repo;
+  };
+  let repo = allRepo();
+  reset({ localizeReadAt: g(repo, 'hash-object', 'resources/js/Hello.tsx').trim() });
+  let r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(localizeCalls().length, 2, 'the patched file is what the server read before the patch: no third call');
+
+  fs.rmSync(repo, { recursive: true, force: true });
+  repo = allRepo();
+  reset({ localizeReadAt: '0'.repeat(40) });
+  r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const locs = localizeCalls();
+  assert.equal(locs.length, 3);
+  assert.deepEqual(locs[2].body.params.arguments.context, [{ path: 'resources/js/Hello.tsx', content: "export const Hello = () => <p>{t('Hello')}</p>;\n" }]);
 });
 
 // ── 0.2.11: the report counts every file the patch changed; the hook localizes the session's project ──

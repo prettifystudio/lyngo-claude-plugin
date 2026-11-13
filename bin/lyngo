@@ -872,17 +872,26 @@ async function allSourceFiles(top) {
 }
 
 function sha1(p) { try { return crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex'); } catch { return null; } }
+// The SHA git names a file's content by (git hash-object).
+function gitBlob(content) {
+  const bytes = Buffer.isBuffer(content) ? content : Buffer.from(String(content), 'utf8');
+  return crypto.createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+}
 
 // The paths a localize answer listed in "needs", read from the repository as
 // {path, content}: only source files (SRC, not SKIP, never .env or keys),
 // relative paths that stay inside it (no symlink out),
 // regular files of at most 512 KB, not already in the batch, 50 at most (the
 // server's limits). A missing or unreadable one is left out, and so is one that is not UTF-8 (named in notUtf8).
+// "needs_sha" names the blob the server read a path at (a file a cross-file
+// decision read, 0.2.18): a copy with that blob is what the server read, so it
+// is left out. The copy is the one an earlier batch sent (before its patch), else the disk's.
 const CONTEXT_MAX_FILES = 50;
 const CONTEXT_MAX_BYTES = 512 * 1024;
-function contextFiles(top, needs, payload, notUtf8) {
+function contextFiles(top, needs, payload, notUtf8, needsSha = {}, sentBlobs = new Map()) {
   if (!Array.isArray(needs)) return [];
   const sent = new Set(payload.map((f) => f.path));
+  const readAt = needsSha && typeof needsSha === 'object' ? needsSha : {};
   let realTop;
   try { realTop = fs.realpathSync(top); } catch { return []; }
   const out = [];
@@ -894,7 +903,9 @@ function contextFiles(top, needs, payload, notUtf8) {
       if (!full.startsWith(realTop + path.sep)) continue;
       const st = fs.statSync(full);
       if (!st.isFile() || st.size > CONTEXT_MAX_BYTES) continue;
-      const content = utf8(fs.readFileSync(full));
+      const bytes = fs.readFileSync(full);
+      if (typeof readAt[p] === 'string' && (sentBlobs.get(p) || gitBlob(bytes)) === readAt[p]) continue;
+      const content = utf8(bytes);
       if (content === null) { if (notUtf8) notUtf8.add(p); continue; }
       out.push({ path: p, content });
     } catch { /* missing or unreadable: left out */ }
@@ -1018,10 +1029,11 @@ async function localize(opts) {
   const changedPaths = new Set();
   const failed = []; // {path, reason, block} of each file whose block did not apply
   const enumCounts = {};
+  const sentBlobs = new Map(); // path => blob of the content last sent: a batch's files before its patch
   while (files.length) {
     batch++;
     const payload = [];
-    for (const p of files) { const c = readIfFile(p, notUtf8); if (c !== null) payload.push({ path: p, content: c }); }
+    for (const p of files) { const c = readIfFile(p, notUtf8); if (c !== null) { payload.push({ path: p, content: c }); sentBlobs.set(p, gitBlob(c)); } }
     if (payload.length === 0) break;
     const args = { files: payload, catalogs: catalogsNow(), format: 'patch' };
     if (opts.languages) args.languages = opts.languages.filter((l) => l !== status.primary_language);
@@ -1032,7 +1044,8 @@ async function localize(opts) {
     // the working tree may be ahead (an enum an unpushed run gave getLabel(),
     // vito 2026-11-08). That answer is not applied: the batch goes once more
     // with those files from disk as read-only context. Older servers never send it.
-    const context = contextFiles(top, r.needs, payload, notUtf8);
+    // A file whose blob is the one the server read (needs_sha) is left out; none left, the answer applies.
+    const context = contextFiles(top, r.needs, payload, notUtf8, r.needs_sha, sentBlobs);
     if (context.length) {
       if (progress) progress(`  ... sending ${context.length} file${context.length === 1 ? '' : 's'} the server reads from this working tree, and the batch again`);
       r = await callJob('localize', { ...args, context }, progress);
