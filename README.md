@@ -72,8 +72,9 @@ already set up.
   It names each file it did not change, keeps those blocks in a temporary
   file, and exits with code 1. The next run sends those files again.
 - A repository that was never localized: `lyngo localize --all` once. It walks
-  every source file a scan would read, in batches, and leaves the result in
-  your working tree to review and commit. No pull request.
+  every source file a scan would read, in batches. It also reads the new
+  files that git does not track yet and does not ignore. It leaves the result
+  in your working tree to review and commit. No pull request.
 - Anything pushed without it still gets a pull request from the Lyngo GitHub
   App.
 

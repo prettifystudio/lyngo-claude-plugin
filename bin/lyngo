@@ -983,13 +983,21 @@ function changedFiles(top) {
 // a quick local cut by extension and folder, then the server's own rules.
 async function allSourceFiles(top) {
   // The files of checked-out submodules too (packages/ui of lyngo-gaps): the app renders them.
-  const tracked = git(['ls-files', '-z', '--recurse-submodules']).split('\0').filter(Boolean).filter((p) => SRC.test(p) && !SKIP.test(p) && fs.existsSync(path.join(top, p)));
-  if (tracked.length === 0) return [];
+  // And the untracked files git does not ignore: init creates files (a LanguageSwitcher.tsx)
+  // that are not committed yet, and the hook sends them too. A separate call:
+  // --recurse-submodules works with tracked files only.
+  const listed = [
+    ...git(['ls-files', '-z', '--recurse-submodules']).split('\0'),
+    ...git(['ls-files', '-z', '--others', '--exclude-standard']).split('\0'),
+  ];
+  const paths = [...new Set(listed.filter(Boolean))].sort().filter((p) => SRC.test(p) && !SKIP.test(p) && fs.existsSync(path.join(top, p)));
+  if (paths.length === 0) return [];
+  const known = new Set(paths);
   try {
-    const r = await call('select_files', { paths: tracked });
-    if (Array.isArray(r.paths)) return r.paths.filter((p) => tracked.includes(p));
+    const r = await call('select_files', { paths });
+    if (Array.isArray(r.paths)) return r.paths.filter((p) => known.has(p));
   } catch { /* an older server without the tool: the local cut stands */ }
-  return tracked;
+  return paths;
 }
 
 function sha1(p) { try { return crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex'); } catch { return null; } }

@@ -2190,3 +2190,20 @@ test('localize --dry takes no lock and writes no hook state', async () => {
   assert.ok(!fs.existsSync(hookState(repo)));
   assert.equal(JSON.parse(fs.readFileSync(lockOf(repo), 'utf8')).token, 'other');
 });
+
+test('localize --all sends the untracked source files git does not ignore, once each, and never an ignored one', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'resources', 'js', 'components'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'components', 'LanguageSwitcher.tsx'), 'export const LanguageSwitcher = () => <p>Language</p>;\n');
+  fs.mkdirSync(path.join(repo, 'resources', 'js', 'generated'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'generated', 'routes.ts'), 'export const routes = {};\n');
+  fs.writeFileSync(path.join(repo, '.gitignore'), 'resources/js/generated/\n');
+  fs.appendFileSync(path.join(repo, 'resources', 'js', 'app.ts'), "import './echo';\n"); // tracked and changed: listed once
+  reset({ localizeNothing: true });
+  const r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const sel = mcpCalls().find((c) => c.body.params.name === 'select_files');
+  assert.deepEqual(sel.body.params.arguments.paths, ['resources/js/app.ts', 'resources/js/components/LanguageSwitcher.tsx']);
+  assert.deepEqual(localizeCalls()[0].body.params.arguments.files.map((f) => f.path), ['resources/js/app.ts', 'resources/js/components/LanguageSwitcher.tsx']);
+});
