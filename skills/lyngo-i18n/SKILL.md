@@ -45,7 +45,9 @@ They exit, then start Claude Code again in this repository with
    "Stop hook feedback". Then tell the user in one or two sentences what Lyngo
    changed, and do not edit those files or the catalogs again. When
    `lyngo init` added the hook in this session, the hook does not run until the
-   user restarts Claude Code; until then, do as when there is no hook.
+   user restarts Claude Code; until then, do as when there is no hook. When
+   the hook says that another Lyngo run is in progress, do nothing: the next
+   stop sends the changes. Never start a second Lyngo run beside one that runs.
    **When the user asks to localize or translate**, or there is no hook: run
    `lyngo localize` from the repository root (if `lyngo` is not on PATH:
    `node "${CLAUDE_PLUGIN_ROOT}/bin/lyngo" localize`) and show the user its

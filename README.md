@@ -57,8 +57,20 @@ already set up.
 - With an agent: build as usual. The hook runs `lyngo localize --hook` at the
   end of every task. You see one line (what was localized and translated); the
   agent gets the full report and tells you what changed. It stays silent when
-  nothing changed, and sends a file again only after it is edited.
+  nothing changed, and sends a file again only after it is edited. This is
+  also true after a `lyngo localize` or `lyngo localize --all` that you run
+  yourself: the next stop sends only the files edited after that run.
 - Without an agent: run `lyngo localize` before you commit.
+- One Lyngo run at a time in a repository. `localize`, `translate` and `init`
+  hold a lock file in the git directory (`.git/lyngo.lock`, never tracked).
+  When the hook finds another run, it does nothing and says so in one line.
+  The next stop sends the changes. A command that you start waits up to 2
+  minutes for the other run, and stops at once when the other run is
+  `localize --all`. A lock whose process is dead, or that nobody touched for
+  15 minutes, is taken over.
+- When the patch does not apply as a whole, the CLI applies it file by file.
+  It names each file it did not change, keeps those blocks in a temporary
+  file, and exits with code 1. The next run sends those files again.
 - A repository that was never localized: `lyngo localize --all` once. It walks
   every source file a scan would read, in batches, and leaves the result in
   your working tree to review and commit. No pull request.

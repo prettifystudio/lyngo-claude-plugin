@@ -56,6 +56,99 @@ function root() {
   if (top === null) fail('not a git repository. Run lyngo inside your project.');
   return top.trim();
 }
+
+// ── one run at a time ──────────────────────────────────────────────────────
+// Two runs in one repository patch the same files: the Stop hook patched a
+// layout while localize --all waited for the server, and the --all patch then
+// did not apply (2026-11-14). Every command that writes files (localize,
+// translate, init, onboard) holds a lock file in the git directory, which git
+// never tracks. The file names the holder: pid, host, command, start time.
+// The holder touches it every 30 s. A lock is stale, and another run takes it
+// over, when its pid is dead on this machine or nobody touched it for 15 minutes.
+const LOCK_BEAT_MS = 30 * 1000;
+const LOCK_STALE_MS = 15 * 60 * 1000;
+const LOCK_FILL_MS = 10 * 1000; // a new lock file is empty until its holder writes it
+const LOCK_WAIT_SECONDS = 120; // how long a run started by hand waits for another run
+let lock = null; // the lock this process holds: { file, token, timer }
+let lockExitHandlers = false;
+
+const lockFile = (top) => path.resolve(top, git(['rev-parse', '--git-path', 'lyngo.lock']).trim());
+function alive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
+
+// What the lock file says: { gone } when there is none, else its text, its holder, and whether it is stale.
+function readLock(file) {
+  let raw, st;
+  try { raw = fs.readFileSync(file, 'utf8'); st = fs.statSync(file); } catch { return { gone: true }; }
+  const age = Date.now() - st.mtimeMs;
+  let h = null;
+  try { h = JSON.parse(raw); } catch { /* still being written, or damaged */ }
+  if (!h || typeof h !== 'object' || !Number.isInteger(h.pid) || h.pid <= 0) return { raw, holder: {}, stale: age > LOCK_FILL_MS };
+  const here = h.host === os.hostname();
+  return { raw, holder: h, stale: age > LOCK_STALE_MS || (here && (h.pid === process.pid || !alive(h.pid))) };
+}
+
+function releaseLock() {
+  if (!lock) return;
+  clearInterval(lock.timer);
+  try { if (JSON.parse(fs.readFileSync(lock.file, 'utf8')).token === lock.token) fs.unlinkSync(lock.file); } catch { /* gone, or another run took it over */ }
+  lock = null;
+}
+
+// Takes the lock of the repository. Returns null when this process holds it
+// (it may hold it already), else what the holder's lock file says.
+function takeLock(top, command) {
+  if (lock) return null;
+  const file = lockFile(top);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const token = crypto.randomBytes(8).toString('hex');
+    try {
+      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, host: os.hostname(), command, started_at: new Date().toISOString(), token }) + '\n', { flag: 'wx' });
+      const timer = setInterval(() => { try { const now = new Date(); fs.utimesSync(file, now, now); } catch { /* released */ } }, LOCK_BEAT_MS);
+      timer.unref();
+      lock = { file, token, timer };
+      if (!lockExitHandlers) {
+        // Released on every way out: the end, an error (process.exit), and these signals.
+        lockExitHandlers = true;
+        process.on('exit', releaseLock);
+        for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143], ['SIGHUP', 129]]) process.on(signal, () => { releaseLock(); process.exit(code); });
+      }
+      return null;
+    } catch (e) {
+      if (e.code !== 'EEXIST') fail(`could not create the lock file ${file} (${e.code || e.message}).`);
+    }
+    const seen = readLock(file);
+    if (seen.gone) continue;
+    if (!seen.stale) return seen.holder;
+    // Stale: move it aside, and delete it only when it is still the file judged stale.
+    const aside = `${file}.${process.pid}.stale`;
+    try { fs.renameSync(file, aside); } catch { continue; }
+    let moved = null;
+    try { moved = fs.readFileSync(aside, 'utf8'); } catch { /* gone */ }
+    if (moved !== seen.raw) { try { fs.linkSync(aside, file); } catch { /* a newer lock is in place */ } }
+    try { fs.unlinkSync(aside); } catch { /* gone */ }
+  }
+  return readLock(file).holder || {};
+}
+
+const holderText = (h) => [h.command ? `lyngo ${h.command}` : 'a lyngo run', h.pid ? `pid ${h.pid}` : '', h.started_at ? `started ${new Date(h.started_at).toTimeString().slice(0, 8)}` : ''].filter(Boolean).join(', ');
+
+// A run started by hand waits for the other run, up to 2 minutes: a Stop hook
+// run takes a minute or two, and the person or the agent then has the result
+// without a second command. It does not wait for localize --all, which can
+// take an hour: it stops at once and says so.
+async function holdLock(top, command) {
+  let holder = takeLock(top, command);
+  if (!holder) return;
+  if (holder.command === 'localize --all') fail(`another Lyngo run is in progress in this repository (${holderText(holder)}). It can take a long time. Run this command again when it ends.`);
+  console.error(`lyngo: another Lyngo run is in progress in this repository (${holderText(holder)}). Waiting for it to end, up to ${LOCK_WAIT_SECONDS / 60} minutes.`);
+  const start = Date.now();
+  while (holder) {
+    if (Date.now() - start >= LOCK_WAIT_SECONDS * TICK) fail(`another Lyngo run still holds this repository after ${LOCK_WAIT_SECONDS / 60} minutes (${holderText(holder)}). Run this command again when it ends. If no Lyngo run is going on, delete ${lockFile(top)}.`);
+    await sleep(1);
+    holder = takeLock(top, command);
+  }
+}
+
 let remoteCache;
 function repoRemote() {
   if (remoteCache === undefined) {
@@ -623,6 +716,8 @@ async function init(opts) {
   // there still leaves the hook and the MCP server in place (corp1, 2026-10-18).
   setUpClaudeCode(top, remote);
   project = await chooseLanguages(project, opts);
+  // The scaffolding patch and the new catalogs: no other Lyngo run at the same time.
+  await holdLock(top, 'init');
   await scaffold(project, opts);
   await fillMissingCatalogs(project, opts);
   console.log('Done. Build as usual; lyngo localize runs when your agent finishes, or run it yourself before committing.');
@@ -684,6 +779,8 @@ async function translate(opts) {
   readToken();
   const codes = opts._;
   if (!codes.length) fail('usage: lyngo translate <code> [<code>...]  (fills every key the language lacks)');
+  // It writes the catalogs whole: a localize run at the same time would lose its keys.
+  await holdLock(top, 'translate');
   const st = await call('status', {});
   const project = { primary_language: st.primary_language, languages: [st.primary_language, ...(st.languages || [])], i18n: st.i18n };
   for (const code of codes) {
@@ -843,6 +940,7 @@ async function onboard(opts) {
 
   // 5. Setup as a patch, 6. the hook, missing catalogs.
   step(5, 'Applying the i18n setup');
+  await holdLock(top, 'onboard');
   await scaffold(project, opts);
   await report('setup', 'done', detected.summary || 'ready');
   step(6, 'Wiring the agent');
@@ -936,15 +1034,54 @@ function contextFiles(top, needs, payload, notUtf8, needsSha = {}, sentBlobs = n
   return out;
 }
 
-// The paths a unified diff changes (its "+++ b/<path>" lines; a deleted file has none).
+// The file blocks of a unified diff, each as text. A block starts at a
+// "diff --git" line, or at a "--- " line followed by "+++ " outside a hunk.
+// The server writes the second form only (sebastian/diff, no "diff --git"
+// line): split on "diff --git" alone, a 55-file patch was one block, rejected
+// whole as "1 file not changed" (2026-11-14). The "@@" line gives each hunk's
+// length, so a removed line "-- x" and an added line "++ y" inside a hunk never
+// start a block.
+function patchBlocks(patch) {
+  const lines = String(patch).split('\n');
+  if (lines[lines.length - 1] === '') lines.pop();
+  const blocks = [];
+  let cur = null;
+  let gitHeader = null; // the "diff --git" line of a block whose "+++" line has not come yet
+  let oldLeft = 0;
+  let newLeft = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (cur && (oldLeft > 0 || newLeft > 0)) {
+      const c = l[0];
+      if (c === ' ' || l === '') { oldLeft--; newLeft--; cur.push(l); continue; }
+      if (c === '-') { oldLeft--; cur.push(l); continue; }
+      if (c === '+') { newLeft--; cur.push(l); continue; }
+      if (c === '\\') { cur.push(l); continue; }
+      oldLeft = newLeft = 0; // a hunk shorter than its "@@" line says: git names the problem
+    }
+    if (l.startsWith('diff --git ')) { cur = [l]; blocks.push(cur); gitHeader = l; continue; }
+    if (l.startsWith('--- ') && (lines[i + 1] || '').startsWith('+++ ')) {
+      // The "---" line of a "diff --git" header, or a new block (the header had no "---" line: a mode change, an empty file).
+      const p = blockPath(l + '\n' + lines[i + 1]);
+      if (!(gitHeader && (gitHeader.endsWith(' b/' + p) || gitHeader.startsWith(`diff --git a/${p} `)))) { cur = []; blocks.push(cur); }
+    }
+    if (l.startsWith('+++ ')) gitHeader = null;
+    const h = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(l);
+    if (h) { oldLeft = h[1] === undefined ? 1 : Number(h[1]); newLeft = h[2] === undefined ? 1 : Number(h[2]); gitHeader = null; }
+    if (cur) cur.push(l);
+  }
+  return blocks.map((b) => b.join('\n') + '\n');
+}
+
+// The paths a unified diff changes, one per file block.
 function patchPaths(patch) {
-  return [...String(patch).matchAll(/^\+\+\+ b\/(.+?)\t?$/gm)].map((m) => m[1]);
+  return patchBlocks(patch).map(blockPath).filter((p) => p !== null);
 }
 
 // git apply is all or nothing: one block that does not apply (a file the server
-// read differently) dropped the 8 good files of its batch with it (lyngo-gaps,
-// 2026-11-11). When the whole patch fails, each file's "diff --git" block goes
-// alone. Returns the paths applied and, for the rest, git's reason.
+// read differently, or a file another run changed) drops the good files of its
+// batch with it (lyngo-gaps, 2026-11-11). When the whole patch fails, each file
+// block goes alone. Returns the paths applied and, for the rest, git's reason.
 function gitApply(text) {
   const tmp = path.join(os.tmpdir(), `lyngo-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.patch`);
   fs.writeFileSync(tmp, text);
@@ -952,21 +1089,24 @@ function gitApply(text) {
   catch (e) { return String(e.stderr || e.message || 'git apply failed').trim().split('\n').map((l) => l.replace(/^error: /, '').trim()).filter(Boolean).join('; '); }
   finally { try { fs.unlinkSync(tmp); } catch { /* already gone */ } }
 }
+// The path of one file block; null when it names none.
 function blockPath(block) {
   const m = block.match(/^\+\+\+ b\/(.+?)\t?$/m) || block.match(/^--- a\/(.+?)\t?$/m) || block.match(/^diff --git a\/(.+?) b\//);
-  return m ? m[1] : '(unknown file)';
+  return m ? m[1] : null;
 }
+// A failed entry with path null: the patch holds no file block git or this CLI can read.
 function applyPatch(patch) {
   const whole = gitApply(patch);
-  if (whole === null) return { applied: patchPaths(patch), failed: [], split: false };
-  const blocks = String(patch).split(/^(?=diff --git )/m).filter((b) => b.startsWith('diff --git '));
-  if (blocks.length === 0) return { applied: [], failed: [{ path: '(the patch)', reason: whole, block: patch }], split: false };
+  const blocks = patchBlocks(patch);
+  if (whole === null) return { applied: blocks.map(blockPath).filter((p) => p !== null), failed: [], split: false };
+  if (blocks.length === 0) return { applied: [], failed: [{ path: null, reason: whole, block: patch }], split: false };
+  if (blocks.length === 1) return { applied: [], failed: [{ path: blockPath(blocks[0]), reason: whole, block: blocks[0] }], split: false };
   const applied = [];
   const failed = [];
-  for (const b of blocks) {
-    const block = b.endsWith('\n') ? b : b + '\n';
+  for (const block of blocks) {
     const reason = gitApply(block);
-    if (reason === null) applied.push(blockPath(block)); else failed.push({ path: blockPath(block), reason, block });
+    if (reason !== null) failed.push({ path: blockPath(block), reason, block });
+    else if (blockPath(block) !== null) applied.push(blockPath(block));
   }
   return { applied, failed, split: true };
 }
@@ -989,32 +1129,58 @@ async function localize(opts) {
   // In hook mode the report goes to the agent, not the terminal (localizeHook).
   const lines = [];
   const say = (line) => (opts.hook ? lines.push(line) : console.log(line));
+  // The hook state (.git/lyngo-hook.json): each file's sha1 when a run last
+  // sent it and its patch applied. The hook runs at every stop and sends only
+  // the files whose content changed since then, so a stop without new edits
+  // costs nothing. Every run that changes files writes it, the hook, localize
+  // and --all alike: after a run by hand, the first stop sent every changed file
+  // again (2026-11-14).
+  const statePath = path.resolve(top, git(['rev-parse', '--git-path', 'lyngo-hook.json']).trim());
+  const readState = () => { const s = parseCatalog(statePath); return s && typeof s === 'object' && !Array.isArray(s) ? s : {}; };
+  // One Lyngo run at a time in a repository (--dry changes nothing and takes no
+  // lock). The hook never waits: with another run going it says so, records
+  // nothing, and the next stop sends the files. With nothing new it stays silent, as before.
+  if (!opts.dry) {
+    if (opts.hook) {
+      if (!opts.all) { const seen = readState(); if (!changedFiles(top).some((p) => seen[p] !== sha1(p))) return null; }
+      const holder = takeLock(top, 'localize --hook');
+      if (holder) return { busy: holder, lines };
+    } else await holdLock(top, opts.all ? 'localize --all' : 'localize');
+  }
   // --all: the whole repository, not the changed files. The server picks the
   // paths a scan would process out of the tracked tree (its own rules, so
   // the two never drift); the server's batches do the rest (2026-10-18).
   let files = opts.all ? await allSourceFiles(top) : changedFiles(top);
-  // The hook runs at every stop: it sends only the files whose content changed
-  // since its last successful run, so a stop without new edits costs nothing.
-  const changed = files;
-  const statePath = opts.hook ? path.resolve(top, git(['rev-parse', '--git-path', 'lyngo-hook.json']).trim()) : null;
-  if (statePath) { const seen = parseCatalog(statePath) || {}; files = files.filter((p) => seen[p] !== sha1(p)); }
+  const hookState = readState();
+  if (opts.hook) files = files.filter((p) => hookState[p] !== sha1(p));
   // A file in Windows-1252 becomes UTF-8 on disk first (not with --dry, which changes nothing).
   // One that is not UTF-8 after that is never sent (readIfFile): it is named and left as written.
-  // The hook state records it, so the next stop does not name it again.
+  // The hook records it, so the next stop does not name it again.
   const converted = opts.dry ? [] : files.filter((p) => convertToUtf8(p));
   const notUtf8 = new Set();
   files = files.filter((p) => readIfFile(p, notUtf8) !== null);
-  // Recorded after the patch, so the hook's own changes never count as new edits;
-  // a file whose block did not apply is left out, so the next stop sends it again.
+  // Each batch records its files after its patch, so Lyngo's own changes never
+  // count as new edits. Left out, so that the next stop sends them again: a
+  // file whose block did not apply, every file of a batch whose catalog block
+  // did not apply (its keys are not in the catalog), a file the server
+  // deferred, and a file edited on disk while the server worked.
+  const recorded = {};
+  if (opts.hook) for (const p of notUtf8) recorded[p] = sha1(p);
+  const saveHookState = (final) => {
+    if (opts.dry || !Object.keys(recorded).length) return;
+    const next = { ...hookState, ...recorded };
+    if (final) for (const p of Object.keys(next)) if (!fs.existsSync(p)) delete next[p];
+    fs.writeFileSync(statePath, JSON.stringify(next) + '\n');
+  };
+  const blobOf = (p) => { try { return gitBlob(fs.readFileSync(p)); } catch { return null; } };
   const failedPaths = new Set();
-  const saveHookState = () => { if (statePath) fs.writeFileSync(statePath, JSON.stringify(Object.fromEntries(changed.filter((p) => !failedPaths.has(p)).map((p) => [p, sha1(p)]))) + '\n'); };
   if (files.length === 0) {
     if (!notUtf8.size) { say(opts.all ? 'lyngo: no source file of this project found in the repository.' : 'lyngo: nothing changed in the working tree.'); return null; }
     say(`lyngo: nothing sent; ${notUtf8.size} file${notUtf8.size === 1 ? ' is' : 's are'} not UTF-8.`);
     for (const p of notUtf8) say(notUtf8Line(p));
     for (const p of converted) say(convertedLine(p));
-    saveHookState();
-    return { wrapped: 0, files: 0, added: 0, reused: 0, languages: 0, byLanguage: {}, sent: 0, patched: false, lines, changedFiles: 0, changedCatalogs: 0, moreFiles: 0, enumLabels: false, notUtf8: [...notUtf8], failed: [] };
+    saveHookState(true);
+    return { wrapped: 0, files: 0, added: 0, reused: 0, languages: 0, byLanguage: {}, sent: 0, patched: false, lines, changedFiles: 0, changedCatalogs: 0, moreFiles: 0, enumLabels: false, notUtf8: [...notUtf8], failed: [], unreadablePatch: false };
   }
   const status = await call('status', {});
   const langs = opts.languages || [status.primary_language, ...(status.languages || [])];
@@ -1022,6 +1188,7 @@ async function localize(opts) {
   // before EVERY call: a catalog the previous batch created must go back, or
   // the server diffs it as new twice (corp1, 2026-10-18: "already exists").
   const folders = [...new Set([status.i18n?.catalog_folder || 'lang', status.i18n?.js_catalog_folder].filter(Boolean).map((f) => f.replace(/\/+$/, '')))];
+  const isCatalog = (p) => folders.some((f) => p.startsWith(f + '/'));
   // Laravel's own lang/<code>/*.php go too: the server builds the PHP keys on
   // them and diffs against them, or a second run writes them again as new
   // files and the patch fails with "already exists".
@@ -1073,20 +1240,33 @@ async function localize(opts) {
       if (progress) progress(`  ... sending ${context.length} file${context.length === 1 ? '' : 's'} the server reads from this working tree, and the batch again`);
       r = await callJob('localize', { ...args, context }, progress);
     }
+    let before = null; // path => blob right before this batch's patch
+    let batchFailed = [];
     if (r.patch && r.patch.trim()) {
       gotPatch = true;
       if (opts.dry) { process.stdout.write(r.patch); for (const p of patchPaths(r.patch)) changedPaths.add(p); }
       else {
+        before = new Map(payload.map((f) => [f.path, blobOf(f.path)]));
         const a = applyPatch(r.patch);
         for (const p of a.applied) changedPaths.add(p);
         if (a.applied.length) patched = true;
         if (a.split || a.failed.length) {
-          say(`  ${opts.all ? `batch ${batch}: ` : ''}the patch did not apply as a whole; each file alone:`);
+          say(`  ${opts.all ? `batch ${batch}: ` : ''}the patch did not apply as a whole${a.split ? '; each file alone' : ''}:`);
           for (const p of a.applied) say(`    applied: ${p}`);
-          for (const f of a.failed) say(`    failed: ${f.path} (${f.reason})`);
+          for (const f of a.failed) say(`    failed: ${f.path || 'the patch names no file'} (${f.reason})`);
         }
-        for (const f of a.failed) { failed.push(f); failedPaths.add(f.path); }
+        batchFailed = a.failed;
+        for (const f of a.failed) { failed.push(f); if (f.path) failedPaths.add(f.path); }
       }
+    }
+    if (!opts.dry && !batchFailed.some((f) => f.path === null || isCatalog(f.path))) {
+      const later = new Set(r.deferred || []);
+      for (const f of payload) {
+        if (later.has(f.path) || failedPaths.has(f.path)) continue;
+        if ((before ? before.get(f.path) : blobOf(f.path)) !== sentBlobs.get(f.path)) continue;
+        recorded[f.path] = sha1(f.path);
+      }
+      saveHookState(false);
     }
     for (const f of r.report?.files || []) if (f.wrapped?.length) report.files.push(f);
     for (const k of r.report?.dot_keys || []) report.missing.add(k);
@@ -1112,14 +1292,13 @@ async function localize(opts) {
       say(`  batch ${batch}: ${done}/${total} files, ${got} string${got === 1 ? '' : 's'} localized`);
     }
   }
-  saveHookState();
+  saveHookState(true);
   // A file whose block did not apply localized nothing.
   report.files = report.files.filter((f) => !failedPaths.has(f.path));
   const wrapped = report.files.reduce((n, f) => n + f.wrapped.length, 0);
   say(`lyngo: ${wrapped} string${wrapped === 1 ? '' : 's'} localized in ${report.files.length} file${report.files.length === 1 ? '' : 's'}; ${report.added.length} new key${report.added.length === 1 ? '' : 's'}, ${report.reused.length} reused.${serverSeen ? ` (server ${serverSeen})` : ''}`);
   for (const f of report.files) say(`  ${f.path}: ${f.wrapped.slice(0, 6).map((s) => JSON.stringify(s)).join(', ')}${f.wrapped.length > 6 ? ', …' : ''}`);
   // Every file the patch changed, the enum-label edits too (they wrap no string); the catalogs apart.
-  const isCatalog = (p) => folders.some((f) => p.startsWith(f + '/'));
   const editedFiles = [...changedPaths].filter((p) => !isCatalog(p));
   const editedCatalogs = changedPaths.size - editedFiles.length;
   const changedLine = [editedFiles.length ? `files changed: ${editedFiles.length}` : '', editedCatalogs ? `catalogs changed: ${editedCatalogs}` : ''].filter(Boolean).join(', ');
@@ -1148,13 +1327,16 @@ async function localize(opts) {
   for (const sub of [...new Set([...changedPaths].map((p) => submoduleOf(p, subs)).filter(Boolean))].sort()) say(`  ${sub} is a submodule: commit it there too`);
   if (failed.length) {
     // The blocks that did not apply stay on disk for a look; the run exits 1 (the hook always exits 0).
+    // Counted and named file by file: never "1 file" for a whole patch.
     const kept = path.join(os.tmpdir(), `lyngo-failed-${Date.now()}.patch`);
     fs.writeFileSync(kept, failed.map((f) => f.block).join(''));
-    say(`lyngo: ${failed.length} file${failed.length === 1 ? '' : 's'} not changed, the patch did not apply: ${failed.map((f) => f.path).join(', ')}. The blocks are at ${kept}`);
+    const named = failed.filter((f) => f.path).map((f) => f.path);
+    if (named.length) say(`lyngo: ${named.length} file${named.length === 1 ? '' : 's'} not changed, the patch did not apply: ${named.join(', ')}. The blocks are at ${kept}`);
+    if (named.length < failed.length) say(`lyngo: the server's patch did not apply, and it names no file. It is at ${kept}`);
     if (!opts.hook) process.exitCode = 1;
   }
   const wrappedPaths = new Set(report.files.map((f) => f.path));
-  return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length, byLanguage: report.languages, sent: total, patched, lines, changedFiles: editedFiles.length, changedCatalogs: editedCatalogs, moreFiles: editedFiles.filter((p) => !wrappedPaths.has(p)).length, enumLabels: enumParts.length > 0, notUtf8: [...notUtf8], failed: failed.map((f) => f.path) };
+  return { wrapped, files: report.files.length, added: report.added.length, reused: report.reused.length, languages: Object.keys(report.languages).length, byLanguage: report.languages, sent: total, patched, lines, changedFiles: editedFiles.length, changedCatalogs: editedCatalogs, moreFiles: editedFiles.filter((p) => !wrappedPaths.has(p)).length, enumLabels: enumParts.length > 0, notUtf8: [...notUtf8], failed: failed.filter((f) => f.path).map((f) => f.path), unreadablePatch: failed.some((f) => !f.path) };
 }
 
 // ── the Claude Code Stop hook ──────────────────────────────────────────────
@@ -1205,9 +1387,11 @@ async function localizeHook(opts) {
     return;
   }
   if (!r) return;
+  // Another Lyngo run holds the repository: one line for the person, nothing for the agent, no state.
+  if (r.busy) { hookOut('Lyngo: another Lyngo run is in progress in this repository; the changes go in the next stop'); return; }
   const n = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
   // Files Lyngo did not change: a block that did not apply, or a file that is not UTF-8.
-  const problems = [r.failed.length ? `${n(r.failed.length, 'file')} not changed (the patch did not apply)` : '', r.notUtf8.length ? `${n(r.notUtf8.length, 'file')} left as written (not UTF-8)` : ''].filter(Boolean).join('; ');
+  const problems = [r.failed.length ? `${n(r.failed.length, 'file')} not changed (the patch did not apply)` : '', r.unreadablePatch ? 'the patch did not apply' : '', r.notUtf8.length ? `${n(r.notUtf8.length, 'file')} left as written (not UTF-8)` : ''].filter(Boolean).join('; ');
   const tellProblems = problems ? ' Tell the user which files Lyngo did not change and why.' : '';
   if (!r.patched) {
     const checked = r.sent ? `checked ${n(r.sent, 'file')}, nothing to localize` : '';
@@ -1272,7 +1456,8 @@ const HELP = `lyngo ${VERSION}: localization for your repository, from the termi
                                     localize what changed in the working tree, and translate it
                                     (--no-translate: keys only; the project setting "Translate when localizing" is the default)
                                     (--all: the whole repository instead of the changed files, in batches of 30)
-                                    (--hook: the Claude Code Stop hook; one JSON object, only files changed since its last run)
+                                    (--hook: the Claude Code Stop hook; one JSON object, only files changed since the last run)
+                                    (one Lyngo run at a time per repository: a run started by hand waits up to 2 minutes, the hook skips)
   lyngo translate <code> [<code>…]  fill every key a language's catalog lacks, from the primary catalog
   lyngo check <file>                the user-facing strings of one file
   lyngo status                      the project as Lyngo knows it

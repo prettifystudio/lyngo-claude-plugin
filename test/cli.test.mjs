@@ -3,7 +3,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -267,7 +267,8 @@ function safePath(extra = []) {
   return [...new Set(dirs)].join(path.delimiter);
 }
 
-function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {}, bin = BIN } = {}) {
+// onChild gets the process, for a test that signals it while it runs.
+function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {}, bin = BIN, onChild } = {}) {
   const env = { ...process.env, HOME: home(), LYNGO_HOST: base, LYNGO_NO_BROWSER: '1', LYNGO_TICK_MS: '1', PATH: safePath([...pathDirs, fakeInstallers().dir]), GIT_TERMINAL_PROMPT: '0', ...extra };
   delete env.LYNGO_TOKEN;
   delete env.LYNGO_URL;
@@ -276,6 +277,7 @@ function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {}, bin =
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [bin, ...args], { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
     if (input !== undefined) child.stdin.end(input);
+    if (onChild) onChild(child);
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (c) => { stdout += c; });
@@ -1677,11 +1679,13 @@ test('localize never sends a file that is not UTF-8 and names it; the hook recor
   assert.match(r.stdout, /\n {2}left as written, not UTF-8: resources\/js\/Cafe\.tsx\n/);
   assert.deepEqual(fs.readFileSync(path.join(repo, 'resources', 'js', 'Cafe.tsx')), LATIN1);
 
-  // Hello.tsx is patched already: the hook sends it again (no state yet), with nothing left to change.
+  // The run by hand recorded Hello.tsx in the hook state, but never Cafe.tsx: the hook sends nothing and names Cafe.tsx once.
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(hookState(repo), 'utf8'))), ['resources/js/Hello.tsx']);
   reset({ localizeNothing: true });
   const h = await run(['localize', '--hook'], { cwd: repo, input: STOP });
   assert.equal(h.code, 0, h.out);
-  assert.equal(JSON.parse(h.stdout).systemMessage, 'Lyngo: checked 1 file, nothing to localize; 1 file left as written (not UTF-8)');
+  assert.equal(localizeCalls().length, 0);
+  assert.equal(JSON.parse(h.stdout).systemMessage, 'Lyngo: 1 file left as written (not UTF-8)');
   assert.match(JSON.parse(h.stdout).hookSpecificOutput.additionalContext, /left as written, not UTF-8: resources\/js\/Cafe\.tsx/);
   assert.ok(Object.keys(JSON.parse(fs.readFileSync(hookState(repo), 'utf8'))).includes('resources/js/Cafe.tsx'));
   reset();
@@ -1886,4 +1890,303 @@ test('init prints the server\'s detection note: the session is the only source, 
   const r = await run(['init', '--yes', '--languages', 'fr'], { cwd: makeRepo() });
   assert.equal(r.code, 0, r.out);
   assert.ok(r.stdout.includes('Scaffolding applied:\n  package.json\n  resources/js/i18n.ts\n  ' + note + '\n'), r.stdout);
+});
+
+// ── 2026-11-14: one run at a time, the file-by-file fallback on the server's patch, the hook state after a run by hand ──
+
+const lockOf = (repo) => path.join(repo, '.git', 'lyngo.lock');
+// A lock file as another run writes it: this test process is alive, so its pid holds the lock until the file goes.
+function holdFakeLock(repo, over = {}) {
+  const file = lockOf(repo);
+  fs.writeFileSync(file, JSON.stringify({ pid: process.pid, host: os.hostname(), command: 'localize --hook', started_at: new Date().toISOString(), token: 'other', ...over }) + '\n');
+  return file;
+}
+async function waitFor(cond, what, ms = 10000) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error('timed out waiting for ' + what);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+const statusCalls = () => mcpCalls().filter((c) => c.body.params.name === 'status');
+const BUSY = { systemMessage: 'Lyngo: another Lyngo run is in progress in this repository; the changes go in the next stop' };
+
+test('the hook skips while a run by hand holds the lock: one line, no call, no state; the run by hand records its files, and the next stop sends nothing', async () => {
+  loggedIn();
+  reset({ jobs: {}, jobRunning: 40 });
+  const repo = helloRepo();
+  const manual = run(['localize'], { cwd: repo, env: { LYNGO_TICK_MS: '10' } });
+  await waitFor(() => fs.existsSync(lockOf(repo)) && localizeCalls().length === 1, 'the run by hand to start its job');
+  const held = JSON.parse(fs.readFileSync(lockOf(repo), 'utf8'));
+  assert.equal(held.command, 'localize');
+  assert.equal(held.host, os.hostname());
+  assert.ok(Number.isInteger(held.pid) && held.pid !== process.pid);
+  assert.doesNotMatch(g(repo, 'status', '--porcelain', '--untracked-files=all'), /lyngo\.lock/, 'git never tracks the lock');
+
+  const h = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(h.code, 0, h.out);
+  assert.deepEqual(JSON.parse(h.stdout), BUSY);
+  assert.equal(h.stderr, '');
+  assert.ok(!fs.existsSync(hookState(repo)), 'the hook records nothing');
+  assert.ok(fs.existsSync(lockOf(repo)), 'the hook leaves the lock of the other run alone');
+
+  const m = await manual;
+  assert.equal(m.code, 0, m.out);
+  assert.equal(statusCalls().length, 1, 'the hook called nobody');
+  assert.equal(localizeCalls().length, 1);
+  assert.ok(!fs.existsSync(lockOf(repo)), 'the run by hand released the lock at its end');
+  const file = path.join(repo, 'resources', 'js', 'Hello.tsx');
+  assert.equal(fs.readFileSync(file, 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+  assert.deepEqual(JSON.parse(fs.readFileSync(hookState(repo), 'utf8')), { 'resources/js/Hello.tsx': sha1(file) });
+
+  // The next stop: nothing new since the run by hand, so no call and no line.
+  reset();
+  const after = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(after.code, 0, after.out);
+  assert.equal(after.stdout, '');
+  assert.equal(calls.length, 0);
+});
+
+test('the hook with nothing new stays silent while another run holds the lock', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  holdFakeLock(repo, { command: 'localize' });
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout, '');
+  assert.equal(calls.length, 0);
+});
+
+test('a run by hand waits for the hook to end, then runs; it gives up after 2 minutes with the holder and the lock file named', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const file = holdFakeLock(repo);
+  setTimeout(() => fs.unlinkSync(file), 400);
+  const r = await run(['localize'], { cwd: repo, env: { LYNGO_TICK_MS: '20' } });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stderr, new RegExp(`^lyngo: another Lyngo run is in progress in this repository \\(lyngo localize --hook, pid ${process.pid}, started \\d\\d:\\d\\d:\\d\\d\\)\\. Waiting for it to end, up to 2 minutes\\.\\n`));
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+  assert.ok(!fs.existsSync(file));
+
+  // Never released: the run stops at 2 minutes (240 ms here), changes nothing and leaves the other lock in place.
+  reset();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  holdFakeLock(repo);
+  const t = await run(['localize'], { cwd: repo, env: { LYNGO_TICK_MS: '2' } });
+  assert.equal(t.code, 1, t.out);
+  assert.ok(t.stderr.includes(`lyngo: another Lyngo run still holds this repository after 2 minutes (lyngo localize --hook, pid ${process.pid}, started `), t.stderr);
+  assert.ok(t.stderr.includes(`Run this command again when it ends. If no Lyngo run is going on, delete ${fs.realpathSync(lockOf(repo))}.`) || t.stderr.includes(`delete ${lockOf(repo)}.`), t.stderr);
+  assert.equal(calls.length, 0);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
+  assert.equal(JSON.parse(fs.readFileSync(lockOf(repo), 'utf8')).token, 'other');
+});
+
+test('localize --all holding the lock stops a run by hand, init and translate at once, with no wait', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  holdFakeLock(repo, { command: 'localize --all' });
+  const busy = /another Lyngo run is in progress in this repository \(lyngo localize --all, pid \d+, started \d\d:\d\d:\d\d\)\. It can take a long time\. Run this command again when it ends\./;
+  const l = await run(['localize'], { cwd: repo });
+  assert.equal(l.code, 1, l.out);
+  assert.match(l.stderr, busy);
+  assert.doesNotMatch(l.stderr, /Waiting/);
+  assert.equal(calls.length, 0);
+
+  // init takes the lock before its scaffolding patch: nothing is patched.
+  reset();
+  const i = await run(['init', '--yes', '--languages', 'fr'], { cwd: repo });
+  assert.equal(i.code, 1, i.out);
+  assert.match(i.stderr, busy);
+  assert.equal(calls.filter((c) => c.path === '/cli/projects/p1/scaffold').length, 0);
+  assert.equal(fs.readFileSync(path.join(repo, 'package.json'), 'utf8'), PKG);
+
+  // translate writes whole catalogs: it waits for the lock too.
+  reset();
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), '{"Hello": "Hello"}\n');
+  const t = await run(['translate', 'fr'], { cwd: repo });
+  assert.equal(t.code, 1, t.out);
+  assert.match(t.stderr, busy);
+  assert.ok(!fs.existsSync(path.join(repo, 'lang', 'fr.json')));
+});
+
+test('a stale lock is taken over: a dead pid, no heartbeat for 15 minutes, an empty file older than 10 s; by a run by hand and by the hook', async () => {
+  loggedIn();
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  const old = new Date(Date.now() - 20 * 60 * 1000);
+  const cases = [
+    ['dead pid', (repo) => holdFakeLock(repo, { pid: dead })],
+    ['no heartbeat', (repo) => { const f = holdFakeLock(repo); fs.utimesSync(f, old, old); }],
+    ['empty file', (repo) => { fs.writeFileSync(lockOf(repo), ''); fs.utimesSync(lockOf(repo), old, old); }],
+  ];
+  for (const hook of [false, true]) {
+    for (const [name, make] of cases) {
+      fs.rmSync(path.join(scratch, 'repo'), { recursive: true, force: true });
+      reset();
+      const repo = helloRepo();
+      make(repo);
+      const r = hook ? await run(['localize', '--hook'], { cwd: repo, input: STOP }) : await run(['localize'], { cwd: repo });
+      assert.equal(r.code, 0, `${name}: ${r.out}`);
+      assert.doesNotMatch(r.out, /another Lyngo run/, name);
+      assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n", name);
+      assert.ok(!fs.existsSync(lockOf(repo)), `${name}: released`);
+      assert.deepEqual(fs.readdirSync(path.join(repo, '.git')).filter((n) => n.startsWith('lyngo.lock')), [], `${name}: no file left aside`);
+    }
+  }
+});
+
+test('the lock is released on an error and on SIGTERM', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ mcpFail: [500, { message: 'Server Error' }] });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.stderr, /lyngo: Server Error/);
+  assert.ok(!fs.existsSync(lockOf(repo)));
+
+  // Killed while the job runs: the lock goes, the file is not touched, no state is written.
+  reset({ jobs: {}, jobRunning: 1e9 });
+  let child;
+  const killed = run(['localize'], { cwd: repo, env: { LYNGO_TICK_MS: '10' }, onChild: (c) => { child = c; } });
+  try { await waitFor(() => fs.existsSync(lockOf(repo)) && localizeCalls().length === 1, 'the job to start'); } catch (e) { child.kill('SIGKILL'); throw e; }
+  child.kill('SIGTERM');
+  const k = await killed;
+  assert.equal(k.code, 143, k.out);
+  assert.ok(!fs.existsSync(lockOf(repo)));
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
+  assert.ok(!fs.existsSync(hookState(repo)));
+
+  // The next run takes the lock at once.
+  reset();
+  const again = await run(['localize'], { cwd: repo });
+  assert.equal(again.code, 0, again.out);
+  assert.doesNotMatch(again.out, /another Lyngo run/);
+});
+
+// The server's own patch form: "--- a/" and "+++ b/" lines, no "diff --git" line (sebastian/diff).
+const SERVER_PATCH = [
+  '--- a/resources/js/app.ts', '+++ b/resources/js/app.ts', '@@ -1 +1 @@', "-import './not-what-is-there';", "+import './bootstrap.js';",
+  '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', '-export const Hello = () => <p>Hello</p>;', "+export const Hello = () => <p>{t('Hello')}</p>;",
+  '--- a/resources/js/Other.tsx', '+++ b/resources/js/Other.tsx', '@@ -1 +1 @@', '-export const Other = () => <p>Not there</p>;', "+export const Other = () => <p>{t('Not there')}</p>;",
+  '--- /dev/null', '+++ b/lang/en.json', '@@ -0,0 +1,3 @@', '+{', '+    "Hello": "Hello"', '+}',
+  '',
+].join('\n');
+
+test('a server patch without "diff --git" lines that fails as a whole applies file by file: the good files change, each failed one is counted and named, and stays out of the hook state', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'app.ts'), "import './bootstrap';\nimport './echo';\n");
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Other.tsx'), 'export const Other = () => <p>Other</p>;\n');
+  reset({ localizePatch: SERVER_PATCH });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 1, r.out);
+  const hello = path.join(repo, 'resources', 'js', 'Hello.tsx');
+  assert.equal(fs.readFileSync(hello, 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+  assert.equal(fs.readFileSync(path.join(repo, 'lang', 'en.json'), 'utf8'), '{\n    "Hello": "Hello"\n}\n');
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'app.ts'), 'utf8'), "import './bootstrap';\nimport './echo';\n");
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Other.tsx'), 'utf8'), 'export const Other = () => <p>Other</p>;\n');
+  assert.match(r.stdout, /the patch did not apply as a whole; each file alone:\n {4}applied: resources\/js\/Hello\.tsx\n {4}applied: lang\/en\.json\n {4}failed: resources\/js\/app\.ts \(patch failed: resources\/js\/app\.ts:1; resources\/js\/app\.ts: patch does not apply\)\n {4}failed: resources\/js\/Other\.tsx \(patch failed: resources\/js\/Other\.tsx:1; resources\/js\/Other\.tsx: patch does not apply\)\n/);
+  const summary = r.stdout.match(/lyngo: 2 files not changed, the patch did not apply: resources\/js\/app\.ts, resources\/js\/Other\.tsx\. The blocks are at (\S+)\n/);
+  assert.ok(summary, r.stdout);
+  const kept = fs.readFileSync(summary[1], 'utf8');
+  assert.equal(kept, SERVER_PATCH.split('--- a/resources/js/Hello.tsx')[0] + '--- a/resources/js/Other.tsx' + SERVER_PATCH.split('--- a/resources/js/Other.tsx')[1].split('--- /dev/null')[0], 'only the two failed blocks are kept');
+  fs.unlinkSync(summary[1]);
+  assert.match(r.stdout, /files changed: 1, catalogs changed: 1\n/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(hookState(repo), 'utf8')), { 'resources/js/Hello.tsx': sha1(hello) });
+
+  // The next stop sends the two files that did not change, never Hello.tsx.
+  reset({ localizeNothing: true });
+  const h = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(h.code, 0, h.out);
+  assert.deepEqual(localizeCalls()[0].body.params.arguments.files.map((f) => f.path), ['resources/js/Other.tsx', 'resources/js/app.ts']);
+});
+
+test('a server patch that applies as a whole counts every file it names, with no "diff --git" line', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Other.tsx'), 'export const Other = () => <p>Not there</p>;\n');
+  reset({ localizePatch: SERVER_PATCH.split('--- a/resources/js/Hello.tsx').map((part, i) => (i === 0 ? '' : '--- a/resources/js/Hello.tsx' + part)).join('') });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /files changed: 2, catalogs changed: 1\n/);
+  assert.doesNotMatch(r.stdout, /did not apply/);
+});
+
+test('a catalog block that does not apply keeps every file of its batch out of the hook state: the next stop sends them again', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), '{\n    "Other": "Other"\n}\n');
+  reset({ localizePatch: ['--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', '-export const Hello = () => <p>Hello</p>;', "+export const Hello = () => <p>{t('Hello')}</p>;", '--- a/lang/en.json', '+++ b/lang/en.json', '@@ -1,2 +1,3 @@', '-{', '+{', '+    "Hello": "Hello",', '     "Not": "there"', ''].join('\n') });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.stdout, /lyngo: 1 file not changed, the patch did not apply: lang\/en\.json\./);
+  assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\n");
+  assert.ok(!fs.existsSync(hookState(repo)), 'Hello.tsx is not recorded: its key is not in the catalog');
+
+  reset({ localizeNothing: true });
+  const h = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(h.code, 0, h.out);
+  assert.deepEqual(localizeCalls()[0].body.params.arguments.files.map((f) => f.path), ['resources/js/Hello.tsx']);
+});
+
+test('after localize --all the hook sends only the files edited since', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  g(repo, 'add', '.');
+  g(repo, 'commit', '-q', '-m', 'hello');
+  const r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const hello = path.join(repo, 'resources', 'js', 'Hello.tsx');
+  const app = path.join(repo, 'resources', 'js', 'app.ts');
+  assert.deepEqual(JSON.parse(fs.readFileSync(hookState(repo), 'utf8')), { 'resources/js/Hello.tsx': sha1(hello), 'resources/js/app.ts': sha1(app) });
+
+  // Hello.tsx is changed in the working tree (the patch), and recorded as it is: the stop sends nothing.
+  reset();
+  const quiet = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(quiet.code, 0, quiet.out);
+  assert.equal(quiet.stdout, '');
+  assert.equal(calls.length, 0);
+
+  reset({ localizeNothing: true });
+  fs.appendFileSync(app, "import './echo';\n");
+  const h = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(h.code, 0, h.out);
+  assert.deepEqual(localizeCalls()[0].body.params.arguments.files.map((f) => f.path), ['resources/js/app.ts']);
+  // Recorded on top of the state of --all: Hello.tsx stays in it.
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(hookState(repo), 'utf8'))).sort(), ['resources/js/Hello.tsx', 'resources/js/app.ts']);
+});
+
+test('a file edited while the server works is not recorded, even when its patch still applies: the next stop sends it', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const hello = path.join(repo, 'resources', 'js', 'Hello.tsx');
+  const other = path.join(repo, 'resources', 'js', 'Other.tsx');
+  fs.writeFileSync(hello, 'export const Hello = () => <p>Hello</p>;\nexport const X = 1;\n');
+  fs.writeFileSync(other, 'export const Other = 1;\n');
+  reset({ jobs: {}, jobRunning: 30, localizePatch: ['--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1,2 +1,2 @@', '-export const Hello = () => <p>Hello</p>;', "+export const Hello = () => <p>{t('Hello')}</p>;", ' export const X = 1;', ''].join('\n') });
+  const manual = run(['localize'], { cwd: repo, env: { LYNGO_TICK_MS: '10' } });
+  await waitFor(() => localizeCalls().length === 1, 'the job to start');
+  fs.appendFileSync(hello, 'export const Bye = () => <p>Bye</p>;\n');
+  const m = await manual;
+  assert.equal(m.code, 0, m.out);
+  assert.equal(fs.readFileSync(hello, 'utf8'), "export const Hello = () => <p>{t('Hello')}</p>;\nexport const X = 1;\nexport const Bye = () => <p>Bye</p>;\n");
+  assert.deepEqual(JSON.parse(fs.readFileSync(hookState(repo), 'utf8')), { 'resources/js/Other.tsx': sha1(other) });
+
+  reset({ localizeNothing: true });
+  const h = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(h.code, 0, h.out);
+  assert.deepEqual(localizeCalls()[0].body.params.arguments.files.map((f) => f.path), ['resources/js/Hello.tsx']);
+});
+
+test('localize --dry takes no lock and writes no hook state', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  holdFakeLock(repo, { command: 'localize --all' });
+  const r = await run(['localize', '--dry'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /^--- a\/resources\/js\/Hello\.tsx|^diff --git/m);
+  assert.ok(!fs.existsSync(hookState(repo)));
+  assert.equal(JSON.parse(fs.readFileSync(lockOf(repo), 'utf8')).token, 'other');
 });
