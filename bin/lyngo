@@ -646,8 +646,12 @@ async function scaffold(project, opts = {}) {
   fail('the server kept asking for more files. Run lyngo init again.');
 }
 
-// The Lyngo plugin as `claude plugin list` shows it: installed, and whether it
-// brings the Stop hook (enabled, with hooks/hooks.json: plugin 0.2.22 and newer).
+// Runs the claude command in the repository; a marketplace refresh fetches over the network, so it has a time limit.
+const claudeRunner = (claude, cwd) => (args) => execFileSync(claude, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 90 * 1000 });
+
+// The Lyngo plugin as `claude plugin list` shows it: installed, its id, version
+// and scope, and whether it brings the Stop hook (enabled, with
+// hooks/hooks.json: plugin 0.2.22 and newer).
 function lyngoPlugin(run) {
   let out = '';
   try { out = run(['plugin', 'list', '--json']); } catch { try { out = run(['plugin', 'list']); } catch { /* no plugin support */ } }
@@ -655,14 +659,55 @@ function lyngoPlugin(run) {
   try { list = JSON.parse(out); } catch { /* an older Claude Code prints only the text list */ }
   if (!Array.isArray(list)) return { installed: /\blyngo\b/.test(out), hook: false };
   const p = list.find((x) => x && typeof x.id === 'string' && x.id.startsWith('lyngo@'));
-  return { installed: !!p, hook: !!(p && p.enabled && typeof p.installPath === 'string' && fs.existsSync(path.join(p.installPath, 'hooks', 'hooks.json'))) };
+  if (!p) return { installed: false, hook: false };
+  return { installed: true, id: p.id, version: p.version, scope: p.scope, hook: !!(p.enabled && typeof p.installPath === 'string' && fs.existsSync(path.join(p.installPath, 'hooks', 'hooks.json'))) };
+}
+
+// Keeps the plugin at the CLI's version (plugin.json and package.json carry the
+// same one). Claude Code updates only its own marketplaces by itself, so a
+// person who installed the plugin before 0.2.22 never got its Stop hook. The
+// commands of the plugin reference (code.claude.com/docs/en/plugins/cli-reference):
+// refresh the marketplace, then update the plugin in its scope. Returns the
+// plugin as it is now, and whether the update gave a newer version. Any
+// failure leaves the plugin as it is, without a word.
+function updatePlugin(run, plugin) {
+  if (!plugin.id || !plugin.version || compareVersions(plugin.version, VERSION) >= 0) return { plugin, updated: false };
+  try {
+    run(['plugin', 'marketplace', 'update', plugin.id.slice(plugin.id.indexOf('@') + 1)]);
+    run(['plugin', 'update', plugin.id, ...(['user', 'project', 'local'].includes(plugin.scope) ? ['--scope', plugin.scope] : [])]);
+  } catch { return { plugin, updated: false }; }
+  const now = lyngoPlugin(run);
+  return { plugin: now, updated: !!now.version && compareVersions(now.version, plugin.version) > 0 };
+}
+const pluginUpdatedLine = (v) => `Claude Code: the Lyngo plugin is updated to ${v}.`;
+
+// The same once a day in the commands a person or an agent runs, never in the
+// Stop hook (one JSON object, and a stop must stay quick). init and onboard do it in setUpClaudeCode.
+const PLUGIN_CHECK_FILE = path.join(TOKEN_DIR, 'plugin-check.json');
+let pluginChecked = false;
+function dailyPluginUpdate() {
+  if (quiet || pluginChecked) return;
+  pluginChecked = true;
+  try {
+    let last = {};
+    try { last = JSON.parse(fs.readFileSync(PLUGIN_CHECK_FILE, 'utf8')) || {}; } catch { /* never checked on this machine */ }
+    if (Date.now() - Date.parse(last.checked_at) < DAY_MS) return;
+    fs.mkdirSync(TOKEN_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(PLUGIN_CHECK_FILE, JSON.stringify({ checked_at: new Date().toISOString() }) + '\n', { mode: 0o600 });
+    const claude = findOnPath('claude');
+    if (!claude) return;
+    const run = claudeRunner(claude, process.cwd());
+    const { plugin, updated } = updatePlugin(run, lyngoPlugin(run));
+    if (updated) console.error(`${pluginUpdatedLine(plugin.version)} It loads when Claude Code starts next.`);
+  } catch { /* the plugin stays as it is */ }
 }
 
 function setUpClaudeCode(top, remote) {
   const claude = findOnPath('claude');
   if (!claude) { console.log('Claude Code not found: no agent setup. Run lyngo localize before you commit.'); return; }
   const t = readToken();
-  const run = (args) => execFileSync(claude, args, { cwd: top, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const run = claudeRunner(claude, top);
+  pluginChecked = true; // the update below replaces the daily one
   // Claude Code loads the MCP server when the next session starts. It is no
   // reason to restart: until then, the skill does the same work with
   // lyngo status, lyngo lookup and lyngo check.
@@ -682,7 +727,7 @@ function setUpClaudeCode(top, remote) {
   // not load a hook written to a settings file (a session ran 25 hours after
   // init with no Stop hook run, 2026-11-13). Without the plugin, the hook goes
   // to .claude/settings.local.json, as before.
-  const plugin = lyngoPlugin(run);
+  const { plugin, updated } = updatePlugin(run, lyngoPlugin(run));
   const pluginNow = process.env.LYNGO_PLUGIN_HOOK === '1';
   const inSession = process.env.CLAUDECODE === '1'; // init runs in a Claude Code session, not in a terminal
   const dir = path.join(top, '.claude');
@@ -727,11 +772,14 @@ function setUpClaudeCode(top, remote) {
       }
     }
   }
+  // A restart only for a session that does not run the hook yet. A terminal
+  // has no session: the next one loads the hook when it starts. After an
+  // update the restart line says when the new plugin loads; else the update line does.
+  const restart = inSession && !has && !pluginNow;
+  if (updated) console.log(pluginUpdatedLine(plugin.version) + (restart ? '' : ' It loads when Claude Code starts next.'));
   if (viaPlugin) console.log(`Claude Code: the lyngo MCP server is registered for this repository. The Stop hook comes from the Lyngo plugin${pluginNow ? ' and runs in this session from the next stop' : ''}.`);
   else console.log(`Claude Code: the lyngo MCP server is registered for this repository, and the Stop hook ${has ? 'was already' : 'is'} in .claude/settings.local.json.`);
-  // A restart only for a session that does not run the hook yet. A terminal
-  // has no session: the next one loads the hook when it starts.
-  if (inSession && !has && !pluginNow) console.log('Restart Claude Code in this repository so that it loads the Stop hook: exit, then run claude --continue to keep the conversation.');
+  if (restart) console.log('Restart Claude Code in this repository so that it loads the Stop hook: exit, then run claude --continue to keep the conversation.');
   // The slash commands (/lyngo:localize, /lyngo:init, /lyngo:status) and the
   // Stop hook come from the plugin; say how to get it when it is not installed yet.
   if (!plugin.installed) console.log('Slash commands for Claude Code (/lyngo:localize, /lyngo:init, /lyngo:status): claude plugin marketplace add prettifystudio/lyngo-claude-plugin && claude plugin install lyngo@lyngo');
@@ -1586,6 +1634,7 @@ function parse(argv) {
       case 'status': await status(); break;
       default: console.error(`lyngo: unknown command "${cmd}".\n\n${HELP}`); process.exitCode = 1;
     }
+    if (!process.exitCode) dailyPluginUpdate();
   } catch (e) {
     const t = (() => { try { return readToken(false); } catch { return null; } })();
     console.error('lyngo: ' + scrub(e instanceof CliError ? e.message : (e && e.message) || String(e), t));

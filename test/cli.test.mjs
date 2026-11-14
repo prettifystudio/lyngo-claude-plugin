@@ -248,7 +248,9 @@ function loggedIn() {
 
 // `notRegistered`: `claude mcp remove` fails, as when no lyngo MCP server is registered yet.
 // `plugins`: what `claude plugin list --json` prints (nothing by default, as an older Claude Code).
-function stubClaude({ notRegistered = false, plugins } = {}) {
+// `updateTo`: what it prints after `claude plugin update`; `updateFails`: `claude plugin marketplace update` fails.
+// It never touches a real Claude Code configuration.
+function stubClaude({ notRegistered = false, plugins, updateTo, updateFails = false } = {}) {
   const dir = path.join(scratch, 'stub');
   fs.mkdirSync(dir, { recursive: true });
   const log = path.join(scratch, 'claude.log');
@@ -258,18 +260,28 @@ function stubClaude({ notRegistered = false, plugins } = {}) {
     const file = path.join(scratch, 'plugins.json');
     fs.writeFileSync(file, JSON.stringify(plugins));
     list = `if [ "$1 $2 $3" = "plugin list --json" ]; then cat "${file}"; fi\n`;
+    if (updateFails) list += `if [ "$1 $2 $3" = "plugin marketplace update" ]; then echo 'network down' >&2; exit 1; fi\n`;
+    if (updateTo) {
+      const after = path.join(scratch, 'plugins-after.json');
+      fs.writeFileSync(after, JSON.stringify(updateTo));
+      list += `if [ "$1 $2" = "plugin update" ]; then cp "${after}" "${file}"; fi\n`;
+    }
   }
   fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a" >> "${log}"; done\nprintf -- '---\\n' >> "${log}"\n${fail}${list}`, { mode: 0o755 });
-  return { dir, log };
+  return { dir, log, calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('---\n').filter(Boolean).map((b) => b.trim().split('\n')) : []) };
 }
 
 // An installed Lyngo plugin as `claude plugin list --json` shows it; `hook`: its folder has hooks/hooks.json (0.2.22 and newer).
-function installedPlugin({ hook = true, enabled = true } = {}) {
-  const installPath = path.join(scratch, 'plugin-cache', 'lyngo');
+// By default the plugin with the hook is at the CLI's version, so init has nothing to update.
+const CLI_VERSION = JSON.parse(fs.readFileSync(path.join(PLUGIN, 'package.json'), 'utf8')).version;
+function installedPlugin({ hook = true, enabled = true, version = hook ? CLI_VERSION : '0.2.6' } = {}) {
+  const installPath = path.join(scratch, 'plugin-cache', 'lyngo', version);
   fs.mkdirSync(path.join(installPath, 'hooks'), { recursive: true });
   if (hook) fs.copyFileSync(path.join(PLUGIN, 'hooks', 'hooks.json'), path.join(installPath, 'hooks', 'hooks.json'));
-  return [{ id: 'ponytail@ponytail', version: '5.3.2', scope: 'user', enabled: true, installPath: scratch }, { id: 'lyngo@lyngo', version: hook ? '0.2.22' : '0.2.6', scope: 'user', enabled, installPath }];
+  return [{ id: 'ponytail@ponytail', version: '5.3.2', scope: 'user', enabled: true, installPath: scratch }, { id: 'lyngo@lyngo', version, scope: 'user', enabled, installPath }];
 }
+const UPDATE_CALLS = [['plugin', 'list', '--json'], ['plugin', 'marketplace', 'update', 'lyngo'], ['plugin', 'update', 'lyngo@lyngo', '--scope', 'user'], ['plugin', 'list', '--json']];
+const updatedLine = (v) => `Claude Code: the Lyngo plugin is updated to ${v}.`;
 
 // Fake package managers, first on every test PATH after the test's own stubs:
 // init runs the install the scaffold names, and a test never runs a real one.
@@ -582,6 +594,84 @@ test('init with a plugin that has no Stop hook (older than 0.2.22) or is disable
     fs.rmSync(scratch, { recursive: true, force: true });
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'lyngo-cli-'));
   }
+});
+
+test('init updates a plugin older than the CLI; the updated plugin brings the Stop hook, so no settings hook; one line says when it loads', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude({ plugins: installedPlugin({ hook: false }), updateTo: installedPlugin() });
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(claude.calls().slice(2), UPDATE_CALLS);
+  assert.ok(r.stdout.includes(`${updatedLine(CLI_VERSION)} It loads when Claude Code starts next.\nClaude Code: the lyngo MCP server is registered for this repository. The Stop hook comes from the Lyngo plugin.\n`), r.stdout);
+  assert.ok(!r.stdout.includes('Restart Claude Code'), 'a terminal: no restart line');
+  assert.ok(!r.stdout.includes('claude plugin install'), r.stdout);
+  assert.ok(!fs.existsSync(path.join(repo, '.claude')), 'the updated plugin has the hook: no settings hook');
+  assert.equal(r.stderr, '');
+});
+
+test('init updates the plugin in an open session: one line for the update, then the one restart line; with the plugin\'s signal, no restart', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude({ plugins: installedPlugin({ hook: false }), updateTo: installedPlugin() });
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir], env: SESSION });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(r.stdout.includes(`${updatedLine(CLI_VERSION)}\nClaude Code: the lyngo MCP server is registered for this repository. The Stop hook comes from the Lyngo plugin.\n${RESTART}\n`), r.stdout);
+  assert.equal(r.stdout.split(RESTART).length, 2, 'one restart line');
+  assert.ok(!fs.existsSync(path.join(repo, '.claude')));
+  // A session that runs an older plugin with the hook: the hook runs now, the new version loads at the next start.
+  fs.rmSync(path.join(scratch, 'claude.log'));
+  const older = stubClaude({ plugins: installedPlugin({ version: '0.2.0' }), updateTo: installedPlugin() });
+  const s = await run(['init'], { cwd: repo, pathDirs: [older.dir], env: PLUGIN_SESSION });
+  assert.equal(s.code, 0, s.out);
+  assert.ok(s.stdout.includes(`${updatedLine(CLI_VERSION)} It loads when Claude Code starts next.\nClaude Code: the lyngo MCP server is registered for this repository. The Stop hook comes from the Lyngo plugin and runs in this session from the next stop.\n`), s.stdout);
+  assert.ok(!s.stdout.includes('Restart Claude Code'), s.stdout);
+});
+
+test('init with a plugin at the CLI\'s version updates nothing; a failed update is silent and changes nothing', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const current = stubClaude({ plugins: installedPlugin() });
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [current.dir] });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(!current.calls().some((c) => c.includes('update')), 'no update call');
+  assert.ok(!r.stdout.includes('is updated to'), r.stdout);
+  fs.rmSync(path.join(scratch, 'claude.log'));
+  const failing = stubClaude({ plugins: installedPlugin({ hook: false }), updateTo: installedPlugin(), updateFails: true });
+  const f = await run(['init'], { cwd: repo, pathDirs: [failing.dir] });
+  assert.equal(f.code, 0, f.out);
+  assert.ok(!failing.calls().some((c) => c[1] === 'update'), 'no plugin update after the marketplace refresh failed');
+  assert.ok(!f.out.includes('is updated to') && !f.out.includes('network down'), f.out);
+  assert.match(f.stdout, /and the Stop hook is in \.claude\/settings\.local\.json\./, 'the old plugin has no hook: the settings hook, as before');
+});
+
+test('a command a person runs updates the plugin once a day, on stderr; the Stop hook never calls claude', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude({ plugins: installedPlugin({ hook: false }), updateTo: installedPlugin() });
+  const r = await run(['status'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /^shop: react \/ react-i18next \/ t\(\), catalogs in lang\n/, 'stdout stays the command\'s own output');
+  assert.equal(r.stderr, `${updatedLine(CLI_VERSION)} It loads when Claude Code starts next.\n`);
+  assert.deepEqual(claude.calls(), UPDATE_CALLS);
+  // The same day: no check at all.
+  const again = await run(['status'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.equal(again.code, 0, again.out);
+  assert.equal(again.stderr, '');
+  assert.equal(claude.calls().length, UPDATE_CALLS.length);
+  // The hook, with no check done today: it never calls claude and writes no check.
+  fs.rmSync(path.join(home(), '.config', 'lyngo', 'plugin-check.json'));
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  const hook = await run(['localize', '--hook'], { cwd: repo, pathDirs: [claude.dir], input: '{"stop_hook_active":false}' });
+  assert.equal(hook.code, 0, hook.out);
+  assert.equal(hook.stderr, '');
+  assert.equal(hook.stdout.trim().split('\n').length, 1, 'one JSON object');
+  JSON.parse(hook.stdout);
+  assert.equal(claude.calls().length, UPDATE_CALLS.length, 'no claude call from the hook');
+  assert.ok(!fs.existsSync(path.join(home(), '.config', 'lyngo', 'plugin-check.json')));
 });
 
 test('init beside a settings hook an earlier init wrote, in a session with the plugin: the hook stays (upgraded), no second one, no restart', async () => {

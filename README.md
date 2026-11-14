@@ -128,6 +128,11 @@ session: that is how `lyngo init` knows that the hook runs in this session.
 Both hooks are POSIX sh. On Windows, Claude Code runs them in Git Bash, which
 comes with Git for Windows.
 
+Claude Code updates only Anthropic's own marketplaces by itself. So `lyngo init`,
+and once a day every other `lyngo` command (never the Stop hook), updates the
+plugin when it is older than the CLI. The new plugin loads when Claude Code
+starts next.
+
 ## Other MCP clients
 
 Server `https://lyngo.app/mcp`, headers `Authorization: Bearer <token>` and
