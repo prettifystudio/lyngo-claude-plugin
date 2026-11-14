@@ -1,0 +1,26 @@
+{
+  "description": "Lyngo: when a task ends, localize and translate what the agent changed, in the repositories that lyngo init connected",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"$CLAUDE_ENV_FILE\" ] || echo 'export LYNGO_PLUGIN_HOOK=1' >> \"$CLAUDE_ENV_FILE\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

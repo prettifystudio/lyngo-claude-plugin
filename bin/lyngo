@@ -11,6 +11,7 @@
 //   lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry] [--hook]
 //                                                 localize (+ translate) the working tree's changes
 //   lyngo check <file>                            the user-facing strings of one file
+//   lyngo lookup <text> [<text>…]                 the keys the project has for these texts
 //   lyngo status                                  the project as Lyngo knows it
 //
 // Config: LYNGO_HOST (default https://lyngo.app), LYNGO_URL (MCP endpoint,
@@ -30,9 +31,11 @@ const TOKEN_DIR = path.join(os.homedir(), '.config', 'lyngo');
 const TOKEN_FILE = path.join(TOKEN_DIR, 'token');
 // Milliseconds per protocol second. Tests shrink it; people never set it.
 const TICK = Number(process.env.LYNGO_TICK_MS) > 0 ? Number(process.env.LYNGO_TICK_MS) : 1000;
-// The Stop hook says so when the CLI is not on PATH, instead of a "command not
-// found" that scrolls past unread (corp1 setup, 2026-10-18). No pipe: Claude
-// Code's JSON must reach lyngo on stdin, and stdout must stay one JSON object.
+// The Stop hook in .claude/settings.local.json, for Claude Code without the
+// Lyngo plugin (the plugin ships its own: hooks/stop.sh). It says so when the
+// CLI is not on PATH, instead of a "command not found" that scrolls past unread
+// (corp1 setup, 2026-10-18). No pipe: Claude Code's JSON must reach lyngo on
+// stdin, and stdout must stay one JSON object.
 const HOOK_COMMAND = `if command -v lyngo >/dev/null 2>&1; then lyngo localize --hook; else echo '{"systemMessage":"Lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"}'; fi`;
 const OLD_HOOK_COMMANDS = [
   'lyngo localize 2>&1 | tail -20',
@@ -156,6 +159,22 @@ function repoRemote() {
     remoteCache = inside && inside.trim() === 'true' ? (gitTry(['remote', 'get-url', 'origin']) || '').trim() || null : null;
   }
   return remoteCache;
+}
+
+// The Stop hook of the Claude Code plugin runs in every repository a person
+// opens, and acts only where lyngo.project is set in the repository's git
+// config (hooks/stop.sh). The repository's own config: shared by all its
+// worktrees, never tracked, and git reset --hard or git clean leave it alone.
+// init sets it, and so does every command that the server answers for this
+// repository's project (call).
+let marked = false;
+function markProject() {
+  if (marked) return;
+  marked = true;
+  try {
+    if (!repoRemote()) return;
+    if ((gitTry(['config', '--local', '--get', 'lyngo.project']) || '').trim() !== 'true') git(['config', '--local', 'lyngo.project', 'true']);
+  } catch { /* the plugin's hook stays silent here until the next command */ }
 }
 
 // ── token ──────────────────────────────────────────────────────────────────
@@ -293,7 +312,10 @@ async function call(name, args) {
   if (body.error) fail(body.error.message || JSON.stringify(body.error));
   const text = body.result?.content?.[0]?.text ?? '';
   if (body.result?.isError) fail(text);
-  try { return JSON.parse(text); } catch { fail('unexpected answer: ' + text.slice(0, 200)); }
+  let data;
+  try { data = JSON.parse(text); } catch { fail('unexpected answer: ' + text.slice(0, 200)); }
+  markProject(); // the server answered for this repository's project
+  return data;
 }
 
 // localize and translate run as a job on the server (async: true): the call
@@ -624,68 +646,95 @@ async function scaffold(project, opts = {}) {
   fail('the server kept asking for more files. Run lyngo init again.');
 }
 
+// The Lyngo plugin as `claude plugin list` shows it: installed, and whether it
+// brings the Stop hook (enabled, with hooks/hooks.json: plugin 0.2.22 and newer).
+function lyngoPlugin(run) {
+  let out = '';
+  try { out = run(['plugin', 'list', '--json']); } catch { try { out = run(['plugin', 'list']); } catch { /* no plugin support */ } }
+  let list = null;
+  try { list = JSON.parse(out); } catch { /* an older Claude Code prints only the text list */ }
+  if (!Array.isArray(list)) return { installed: /\blyngo\b/.test(out), hook: false };
+  const p = list.find((x) => x && typeof x.id === 'string' && x.id.startsWith('lyngo@'));
+  return { installed: !!p, hook: !!(p && p.enabled && typeof p.installPath === 'string' && fs.existsSync(path.join(p.installPath, 'hooks', 'hooks.json'))) };
+}
+
 function setUpClaudeCode(top, remote) {
   const claude = findOnPath('claude');
   if (!claude) { console.log('Claude Code not found: no agent setup. Run lyngo localize before you commit.'); return; }
   const t = readToken();
   const run = (args) => execFileSync(claude, args, { cwd: top, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  let mcpNew = false;
-  try { run(['mcp', 'remove', 'lyngo', '-s', 'local']); } catch { mcpNew = true; /* not registered yet */ }
+  // Claude Code loads the MCP server when the next session starts. It is no
+  // reason to restart: until then, the skill does the same work with
+  // lyngo status, lyngo lookup and lyngo check.
+  try { run(['mcp', 'remove', 'lyngo', '-s', 'local']); } catch { /* not registered yet */ }
   try {
     run(['mcp', 'add', '--transport', 'http', '--scope', 'local', 'lyngo', AGENT_MCP_URL,
       '-H', 'Authorization: Bearer ' + t, '-H', 'X-Lyngo-Remote: ' + remote]);
   } catch (e) {
-    mcpNew = false;
     console.error('lyngo: could not register the Lyngo MCP server in Claude Code (' + scrub(((e.stderr || e.message || '') + '').trim(), t) + ').');
     process.exitCode = 1;
   }
 
-  // One Stop hook, in the settings file git does not track.
+  // The Stop hook. The Lyngo plugin ships it (hooks/hooks.json), and Claude
+  // Code loads it when a session starts, so a session that has the plugin runs
+  // it from the first stop after init. The plugin's SessionStart hook sets
+  // LYNGO_PLUGIN_HOOK=1 for the commands of that session. An open session may
+  // not load a hook written to a settings file (a session ran 25 hours after
+  // init with no Stop hook run, 2026-11-13). Without the plugin, the hook goes
+  // to .claude/settings.local.json, as before.
+  const plugin = lyngoPlugin(run);
+  const pluginNow = process.env.LYNGO_PLUGIN_HOOK === '1';
+  const inSession = process.env.CLAUDECODE === '1'; // init runs in a Claude Code session, not in a terminal
   const dir = path.join(top, '.claude');
   const file = path.join(dir, 'settings.local.json');
   let settings = {};
+  let valid = true;
   if (fs.existsSync(file)) {
-    try { settings = JSON.parse(fs.readFileSync(file, 'utf8') || '{}'); } catch {
-      console.error('lyngo: .claude/settings.local.json is not valid JSON; the Stop hook was not added.');
-      process.exitCode = 1;
-      return;
-    }
+    try { settings = JSON.parse(fs.readFileSync(file, 'utf8') || '{}'); } catch { valid = false; settings = {}; }
   }
   settings.hooks = settings.hooks || {};
   const stop = Array.isArray(settings.hooks.Stop) ? settings.hooks.Stop : [];
   const has = stop.some((group) => (group.hooks || []).some((h) => typeof h.command === 'string' && /\blyngo\b[^|]*\blocalize\b/.test(h.command)));
+  // A hook that an earlier init wrote stays: the plugin's hook leaves the stop to it (hooks/stop.sh).
   let upgraded = false;
   for (const group of stop) for (const h of group.hooks || []) {
     if (OLD_HOOK_COMMANDS.includes(h.command)) { h.command = HOOK_COMMAND; upgraded = true; }
   }
-  if (!has) {
+  const viaPlugin = !has && (pluginNow || plugin.hook);
+  if (!has && !viaPlugin) {
+    if (!valid) {
+      console.error('lyngo: .claude/settings.local.json is not valid JSON; the Stop hook was not added.');
+      process.exitCode = 1;
+      return;
+    }
     stop.push({ hooks: [{ type: 'command', command: HOOK_COMMAND }] });
     settings.hooks.Stop = stop;
   }
-  if (!has || upgraded) {
+  if ((!has && !viaPlugin) || upgraded) {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
   }
-  let ignored = true;
-  try { execFileSync('git', ['check-ignore', '-q', '.claude/settings.local.json'], { cwd: top, stdio: 'ignore' }); } catch { ignored = false; }
-  if (!ignored) {
-    const rel = (gitTry(['rev-parse', '--git-path', 'info/exclude']) || '.git/info/exclude').trim();
-    const exclude = path.isAbsolute(rel) ? rel : path.join(top, rel);
-    const text = readIfFile(exclude) || '';
-    if (!text.split('\n').includes('.claude/settings.local.json')) {
-      fs.mkdirSync(path.dirname(exclude), { recursive: true });
-      fs.writeFileSync(exclude, text + (text && !text.endsWith('\n') ? '\n' : '') + '.claude/settings.local.json\n');
+  if (fs.existsSync(file)) {
+    let ignored = true;
+    try { execFileSync('git', ['check-ignore', '-q', '.claude/settings.local.json'], { cwd: top, stdio: 'ignore' }); } catch { ignored = false; }
+    if (!ignored) {
+      const rel = (gitTry(['rev-parse', '--git-path', 'info/exclude']) || '.git/info/exclude').trim();
+      const exclude = path.isAbsolute(rel) ? rel : path.join(top, rel);
+      const text = readIfFile(exclude) || '';
+      if (!text.split('\n').includes('.claude/settings.local.json')) {
+        fs.mkdirSync(path.dirname(exclude), { recursive: true });
+        fs.writeFileSync(exclude, text + (text && !text.endsWith('\n') ? '\n' : '') + '.claude/settings.local.json\n');
+      }
     }
   }
-  console.log(`Claude Code: the lyngo MCP server is registered for this repository, and the Stop hook ${has ? 'was already' : 'is'} in .claude/settings.local.json.`);
-  // A Claude Code session that is open does not load a new hook or MCP server
-  // (a session ran 25 hours after init with no Stop hook run, 2026-11-13).
-  if (!has || mcpNew) console.log('Restart Claude Code in this repository so that it loads the Stop hook and the MCP server: exit, then run claude --continue to keep the conversation.');
-  // The slash commands (/lyngo:localize, /lyngo:init, /lyngo:status) come
-  // from the plugin; say how to get it when it is not installed yet.
-  let installed = false;
-  try { installed = /\blyngo\b/.test(run(['plugin', 'list'])); } catch { /* no plugin support, or none installed */ }
-  if (!installed) console.log('Slash commands for Claude Code (/lyngo:localize, /lyngo:init, /lyngo:status): claude plugin marketplace add prettifystudio/lyngo-claude-plugin && claude plugin install lyngo@lyngo');
+  if (viaPlugin) console.log(`Claude Code: the lyngo MCP server is registered for this repository. The Stop hook comes from the Lyngo plugin${pluginNow ? ' and runs in this session from the next stop' : ''}.`);
+  else console.log(`Claude Code: the lyngo MCP server is registered for this repository, and the Stop hook ${has ? 'was already' : 'is'} in .claude/settings.local.json.`);
+  // A restart only for a session that does not run the hook yet. A terminal
+  // has no session: the next one loads the hook when it starts.
+  if (inSession && !has && !pluginNow) console.log('Restart Claude Code in this repository so that it loads the Stop hook: exit, then run claude --continue to keep the conversation.');
+  // The slash commands (/lyngo:localize, /lyngo:init, /lyngo:status) and the
+  // Stop hook come from the plugin; say how to get it when it is not installed yet.
+  if (!plugin.installed) console.log('Slash commands for Claude Code (/lyngo:localize, /lyngo:init, /lyngo:status): claude plugin marketplace add prettifystudio/lyngo-claude-plugin && claude plugin install lyngo@lyngo');
 }
 
 async function init(opts) {
@@ -703,6 +752,7 @@ async function init(opts) {
 
   const found = await connectProject(opts, remote, branch);
   if (!found) return;
+  markProject();
   let project = found.project;
   const wsName = found.workspace?.name || ws?.name || '';
   console.log(found.status === 'created' ? `Created ${project.name} in workspace ${wsName}.` : `Set up on ${project.name} (workspace ${wsName}).`);
@@ -911,6 +961,7 @@ async function onboard(opts) {
     return;
   } else { await report('github', 'failed', messageOf(r.data, r.status)); printProblem(r); fail('the project could not be created. The message above says why.'); }
   projectId = project.id;
+  markProject();
   saveRunState(id, { ...state, device: null, project_id: projectId });
   await report('github', 'done', project.full_name || project.name);
   console.log(`  ${r.data.status === 'created' ? 'Created' : 'Found'} ${project.name}.`);
@@ -1437,6 +1488,20 @@ async function check(file) {
   if (r.changed === false && r.note) console.log(r.note);
 }
 
+// The MCP tool lookup, for a session that has not loaded the MCP server yet
+// (it loads when a session starts): one line per text.
+async function lookup(texts) {
+  if (!texts.length) fail('usage: lyngo lookup <text> [<text>…]  (quote each text)');
+  const r = await call('lookup', { texts });
+  for (const x of r.results || []) {
+    const parts = [x.refused ? 'refused: leave it as written' : x.key_exists ? 'key exists' : 'no key'];
+    if (x.similar_keys && x.similar_keys.length) parts.push('similar keys: ' + x.similar_keys.map((k) => JSON.stringify(k)).join(', '));
+    const langs = Object.keys(x.translations || {});
+    if (langs.length) parts.push('translated: ' + langs.join(', '));
+    console.log(`${JSON.stringify(x.text)}: ${parts.join('; ')}`);
+  }
+}
+
 async function status() {
   const r = await call('status', {});
   console.log(`${r.project}: ${r.i18n?.framework} / ${r.i18n?.library} / ${r.i18n?.function}(), catalogs in ${r.i18n?.catalog_folder}`);
@@ -1468,6 +1533,7 @@ const HELP = `lyngo ${VERSION}: localization for your repository, from the termi
                                     (one Lyngo run at a time per repository: a run started by hand waits up to 2 minutes, the hook skips)
   lyngo translate <code> [<code>…]  fill every key a language's catalog lacks, from the primary catalog
   lyngo check <file>                the user-facing strings of one file
+  lyngo lookup <text> [<text>…]     the keys the project has for these texts: exists, similar keys, refused
   lyngo status                      the project as Lyngo knows it
 
 Config: LYNGO_HOST (default https://lyngo.app), LYNGO_TOKEN or ~/.config/lyngo/token.`;
@@ -1516,6 +1582,7 @@ function parse(argv) {
       case 'onboard': await onboard(opts); break;
       case 'translate': await translate(opts); break;
       case 'check': await check(opts._[0]); break;
+      case 'lookup': await lookup(opts._); break;
       case 'status': await status(); break;
       default: console.error(`lyngo: unknown command "${cmd}".\n\n${HELP}`); process.exitCode = 1;
     }

@@ -12,8 +12,11 @@ import { fileURLToPath } from 'node:url';
 
 const HOOK = `if command -v lyngo >/dev/null 2>&1; then lyngo localize --hook; else echo '{"systemMessage":"Lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"}'; fi`;
 const HOOK_024 = 'if command -v lyngo >/dev/null 2>&1; then lyngo localize 2>&1 | tail -20; else echo "lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli"; fi';
-const RESTART = 'Restart Claude Code in this repository so that it loads the Stop hook and the MCP server: exit, then run claude --continue to keep the conversation.';
-const BIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'lyngo');
+const RESTART = 'Restart Claude Code in this repository so that it loads the Stop hook: exit, then run claude --continue to keep the conversation.';
+const PLUGIN = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const BIN = path.join(PLUGIN, 'bin', 'lyngo');
+const SESSION = { CLAUDECODE: '1' }; // init runs in a Claude Code session
+const PLUGIN_SESSION = { CLAUDECODE: '1', LYNGO_PLUGIN_HOOK: '1' }; // ... that loaded the plugin's hooks at its start
 const TOKEN = 'lyn_' + 'Z'.repeat(40);
 const REMOTE = 'git@github.com:acme/shop.git';
 const PKG = '{\n  "name": "shop"\n}\n';
@@ -184,6 +187,11 @@ function handle(req, body) {
     const paths = body.params.arguments.paths.filter((p) => !p.endsWith('.d.ts'));
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ paths, count: paths.length, of: body.params.arguments.paths.length }) }] } }];
   }
+  if (key === 'POST /mcp/admin' && body.params.name === 'lookup') {
+    // "Save" has a key and a French value, "save." differs only by case and punctuation, "Admin" is refused.
+    const results = body.params.arguments.texts.map((text) => ({ text, key_exists: text === 'Save', translations: text === 'Save' ? { fr: 'Enregistrer' } : {}, similar_keys: text === 'save.' ? ['Save'] : [], refused: text === 'Admin' }));
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify({ primary: 'en', languages: ['fr'], results }) }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'check') {
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: JSON.stringify(state.check) }] } }];
   }
@@ -239,13 +247,28 @@ function loggedIn() {
 }
 
 // `notRegistered`: `claude mcp remove` fails, as when no lyngo MCP server is registered yet.
-function stubClaude({ notRegistered = false } = {}) {
+// `plugins`: what `claude plugin list --json` prints (nothing by default, as an older Claude Code).
+function stubClaude({ notRegistered = false, plugins } = {}) {
   const dir = path.join(scratch, 'stub');
   fs.mkdirSync(dir, { recursive: true });
   const log = path.join(scratch, 'claude.log');
   const fail = notRegistered ? `if [ "$1 $2" = "mcp remove" ]; then exit 1; fi\n` : '';
-  fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a" >> "${log}"; done\nprintf -- '---\\n' >> "${log}"\n${fail}`, { mode: 0o755 });
+  let list = '';
+  if (plugins) {
+    const file = path.join(scratch, 'plugins.json');
+    fs.writeFileSync(file, JSON.stringify(plugins));
+    list = `if [ "$1 $2 $3" = "plugin list --json" ]; then cat "${file}"; fi\n`;
+  }
+  fs.writeFileSync(path.join(dir, 'claude'), `#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a" >> "${log}"; done\nprintf -- '---\\n' >> "${log}"\n${fail}${list}`, { mode: 0o755 });
   return { dir, log };
+}
+
+// An installed Lyngo plugin as `claude plugin list --json` shows it; `hook`: its folder has hooks/hooks.json (0.2.22 and newer).
+function installedPlugin({ hook = true, enabled = true } = {}) {
+  const installPath = path.join(scratch, 'plugin-cache', 'lyngo');
+  fs.mkdirSync(path.join(installPath, 'hooks'), { recursive: true });
+  if (hook) fs.copyFileSync(path.join(PLUGIN, 'hooks', 'hooks.json'), path.join(installPath, 'hooks', 'hooks.json'));
+  return [{ id: 'ponytail@ponytail', version: '5.3.2', scope: 'user', enabled: true, installPath: scratch }, { id: 'lyngo@lyngo', version: hook ? '0.2.22' : '0.2.6', scope: 'user', enabled, installPath }];
 }
 
 // Fake package managers, first on every test PATH after the test's own stubs:
@@ -274,6 +297,7 @@ function run(args, { cwd = scratch, pathDirs = [], input, env: extra = {}, bin =
   delete env.LYNGO_URL;
   if (!('CI' in extra)) delete env.CI; // a CI runner sets it; init sees it only where a test says so
   if (!('CLAUDE_PROJECT_DIR' in extra)) delete env.CLAUDE_PROJECT_DIR; // set when the suite runs inside Claude Code: the hook would go there
+  for (const k of ['CLAUDECODE', 'LYNGO_PLUGIN_HOOK']) if (!(k in extra)) delete env[k]; // a terminal, unless the test says a session
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [bin, ...args], { cwd, env, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
     if (input !== undefined) child.stdin.end(input);
@@ -362,7 +386,7 @@ test('init on a found project sets everything up, and a second run changes nothi
   loggedIn();
   const repo = makeRepo();
   const claude = stubClaude();
-  const r = await run(['init', '--languages', 'en,fr'], { cwd: repo, pathDirs: [claude.dir] });
+  const r = await run(['init', '--languages', 'en,fr'], { cwd: repo, pathDirs: [claude.dir], env: SESSION });
   assert.equal(r.code, 0, r.out);
   const lines = r.stdout.split('\n');
   assert.equal(lines[0], 'Workspace: Acme');
@@ -374,8 +398,9 @@ test('init on a found project sets everything up, and a second run changes nothi
   assert.match(r.stdout, /Restart your dev server so Vite picks up the new packages\./);
   assert.match(r.stdout, /Done\. Build as usual; lyngo localize runs when your agent finishes, or run it yourself before committing\./);
   assert.match(r.stdout, /Slash commands for Claude Code \(\/lyngo:localize, \/lyngo:init, \/lyngo:status\): claude plugin marketplace add prettifystudio\/lyngo-claude-plugin && claude plugin install lyngo@lyngo/);
-  assert.ok(r.stdout.includes(RESTART), 'a new hook: an open session must restart to load it');
+  assert.ok(r.stdout.includes(RESTART), 'a new hook in a settings file, no plugin: the open session must restart to load it');
   assert.ok(!r.out.includes(TOKEN), 'the token never reaches the terminal');
+  assert.equal(g(repo, 'config', '--local', '--get', 'lyngo.project'), 'true\n', 'the marker the plugin\'s Stop hook reads');
 
   // Every call inside the repository names it.
   for (const c of calls) assert.equal(c.headers['x-lyngo-remote'], REMOTE, c.path);
@@ -404,7 +429,7 @@ test('init on a found project sets everything up, and a second run changes nothi
 
   // Second run: same project, nothing to scaffold, no second hook, no second PATCH.
   reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
-  const again = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  const again = await run(['init'], { cwd: repo, pathDirs: [claude.dir], env: SESSION });
   assert.equal(again.code, 0, again.out);
   assert.match(again.stdout, /Set up on shop/);
   assert.match(again.stdout, /Languages: en -> fr/);
@@ -486,17 +511,103 @@ test('init exits non-zero with the command to run when the package manager is no
   assert.match(r.stderr, /lyngo: bun is not installed, so the new packages are not\. Run bun install in .+ before you start the dev server\./);
 });
 
-test('init says to restart Claude Code when it registers the MCP server new, even with the hook already there', async () => {
+test('init does not ask for a restart for a new MCP server: it loads at the next session, and the CLI does its work until then', async () => {
   loggedIn();
   const repo = makeRepo();
   const claude = stubClaude({ notRegistered: true });
   fs.mkdirSync(path.join(repo, '.claude'));
   fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: HOOK }] }] } }));
   reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
-  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir], env: SESSION });
   assert.equal(r.code, 0, r.out);
   assert.match(r.stdout, /Stop hook was already in/);
-  assert.ok(r.stdout.includes(RESTART), r.stdout);
+  assert.ok(!r.stdout.includes('Restart Claude Code'), r.stdout);
+  const claudeCalls = fs.readFileSync(claude.log, 'utf8').split('---\n').filter(Boolean).map((b) => b.trim().split('\n'));
+  assert.equal(claudeCalls[1][1], 'add', 'the MCP server is still registered');
+});
+
+test('init in a session that loaded the plugin\'s hooks: no settings hook, no restart, the plugin\'s hook runs from the next stop', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude({ plugins: installedPlugin() });
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir], env: PLUGIN_SESSION });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /Claude Code: the lyngo MCP server is registered for this repository\. The Stop hook comes from the Lyngo plugin and runs in this session from the next stop\./);
+  assert.ok(!r.stdout.includes('Restart Claude Code'), r.stdout);
+  assert.ok(!r.stdout.includes('claude plugin install'), 'the plugin is installed: no install line');
+  assert.ok(!fs.existsSync(path.join(repo, '.claude')), 'no settings hook beside the plugin\'s');
+  assert.equal(g(repo, 'config', '--local', '--get', 'lyngo.project'), 'true\n');
+  // The same with a Claude Code too old for `plugin list --json`: the session signal decides alone.
+  fs.rmSync(path.join(scratch, 'claude.log'));
+  const old = stubClaude();
+  const r2 = await run(['init'], { cwd: repo, pathDirs: [old.dir], env: PLUGIN_SESSION });
+  assert.equal(r2.code, 0, r2.out);
+  assert.match(r2.stdout, /The Stop hook comes from the Lyngo plugin and runs in this session from the next stop\./);
+  assert.ok(!fs.existsSync(path.join(repo, '.claude')));
+});
+
+test('init with the plugin installed: no settings hook; a restart only for an open session that started before the plugin', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude({ plugins: installedPlugin() });
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  // A terminal: the next session loads the plugin's hook when it starts.
+  const term = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.equal(term.code, 0, term.out);
+  assert.match(term.stdout, /The Stop hook comes from the Lyngo plugin\.\n/);
+  assert.ok(!term.stdout.includes('Restart Claude Code'), term.stdout);
+  assert.ok(!fs.existsSync(path.join(repo, '.claude')));
+  const listed = fs.readFileSync(claude.log, 'utf8').split('---\n').filter(Boolean).map((b) => b.trim().split('\n'));
+  assert.deepEqual(listed[2], ['plugin', 'list', '--json']);
+  // A session without the plugin's signal (the plugin was installed after it started): restart.
+  const open = await run(['init'], { cwd: repo, pathDirs: [claude.dir], env: SESSION });
+  assert.equal(open.code, 0, open.out);
+  assert.ok(open.stdout.includes(RESTART), open.stdout);
+  assert.ok(!fs.existsSync(path.join(repo, '.claude')));
+});
+
+test('init with a plugin that has no Stop hook (older than 0.2.22) or is disabled writes the settings hook as before', async () => {
+  for (const opts of [{ hook: false }, { enabled: false }]) {
+    loggedIn();
+    const repo = makeRepo();
+    const claude = stubClaude({ plugins: installedPlugin(opts) });
+    reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+    const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.stdout, /and the Stop hook is in \.claude\/settings\.local\.json\./);
+    assert.ok(!r.stdout.includes('Restart Claude Code'), 'a terminal: no restart line');
+    assert.ok(!r.stdout.includes('claude plugin install'), 'installed: no install line');
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8')).hooks.Stop, [{ hooks: [{ type: 'command', command: HOOK }] }]);
+    fs.rmSync(scratch, { recursive: true, force: true });
+    scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'lyngo-cli-'));
+  }
+});
+
+test('init beside a settings hook an earlier init wrote, in a session with the plugin: the hook stays (upgraded), no second one, no restart', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude({ plugins: installedPlugin() });
+  fs.mkdirSync(path.join(repo, '.claude'));
+  fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: HOOK_024 }] }] } }));
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir], env: PLUGIN_SESSION });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /Stop hook was already in \.claude\/settings\.local\.json/);
+  assert.ok(!r.stdout.includes('Restart Claude Code'), r.stdout);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8')).hooks.Stop, [{ hooks: [{ type: 'command', command: HOOK }] }]);
+});
+
+test('init in a terminal without the plugin writes the settings hook and prints no restart line', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const claude = stubClaude();
+  reset({ languages: ['en', 'fr'], scaffold: () => [200, { patch: '', files: [] }] });
+  const r = await run(['init'], { cwd: repo, pathDirs: [claude.dir] });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /and the Stop hook is in \.claude\/settings\.local\.json\./);
+  assert.ok(!r.stdout.includes('Restart Claude Code'), r.stdout);
+  assert.match(r.stdout, /claude plugin install lyngo@lyngo/);
 });
 
 test('init keeps an existing settings file and adds the hook beside it', async () => {
@@ -564,6 +675,151 @@ test('the hook command prints valid JSON when the CLI is not on PATH, and passes
   fs.writeFileSync(path.join(dir, 'lyngo'), '#!/bin/sh\ncat\n', { mode: 0o755 });
   const through = execFileSync('/bin/sh', ['-c', HOOK], { cwd: scratch, encoding: 'utf8', input: '{"stop_hook_active":false}', env: { PATH: dir + ':/usr/bin:/bin' } });
   assert.equal(through, '{"stop_hook_active":false}');
+});
+
+// The plugin's hooks (hooks/hooks.json), run as Claude Code runs a shell-form
+// command: ${CLAUDE_PLUGIN_ROOT} substituted, sh -c, the variables exported.
+const PLUGIN_HOOKS = JSON.parse(fs.readFileSync(path.join(PLUGIN, 'hooks', 'hooks.json'), 'utf8')).hooks;
+function pluginHook(event, { cwd = scratch, projectDir, pathDirs = [], input = '', env = {} } = {}) {
+  const command = PLUGIN_HOOKS[event][0].hooks[0].command.split('${CLAUDE_PLUGIN_ROOT}').join(PLUGIN);
+  const base = [path.dirname(execFileSync('which', ['git'], { encoding: 'utf8' }).trim()), '/usr/bin', '/bin'];
+  for (const d of base) assert.ok(!fs.existsSync(path.join(d, 'lyngo')), `a real lyngo sits in ${d}; the hook test PATH must not reach it`);
+  return spawnSync('/bin/sh', ['-c', command], { cwd, input, encoding: 'utf8', env: { PATH: [...new Set([...pathDirs, ...base])].join(':'), HOME: home(), CLAUDE_PLUGIN_ROOT: PLUGIN, ...(projectDir ? { CLAUDE_PROJECT_DIR: projectDir } : {}), ...env } });
+}
+// A stand-in lyngo that logs its arguments and its stdin, and answers like the hook does.
+function stubLyngo() {
+  const dir = path.join(scratch, 'stub-lyngo');
+  const log = path.join(scratch, 'lyngo.log');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'lyngo'), `#!/bin/sh\nprintf 'lyngo %s\\n' "$*" >> "${log}"\ncat >> "${log}"\nprintf '\\n' >> "${log}"\necho '{"systemMessage":"Lyngo: stub"}'\n`, { mode: 0o755 });
+  return { dir, log, runs: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter((l) => l.startsWith('lyngo ')) : []) };
+}
+const STOP_INPUT = '{"hook_event_name":"Stop","stop_hook_active":false}';
+
+test('the plugin\'s Stop hook is silent and calls nothing outside a Lyngo project: no git repository, or a repository init never set up', () => {
+  const lyngo = stubLyngo();
+  const plain = path.join(scratch, 'plain');
+  fs.mkdirSync(plain);
+  const repo = makeRepo();
+  for (const dir of [plain, repo]) {
+    for (const r of [pluginHook('Stop', { cwd: dir, projectDir: dir, pathDirs: [lyngo.dir], input: STOP_INPUT }), pluginHook('Stop', { cwd: dir, pathDirs: [lyngo.dir], input: STOP_INPUT })]) {
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.stdout, '');
+      assert.equal(r.stderr, '');
+    }
+  }
+  // Without git on PATH too (where /bin holds no git).
+  if (!fs.existsSync('/bin/git')) {
+    const r = spawnSync('/bin/sh', ['-c', PLUGIN_HOOKS.Stop[0].hooks[0].command.split('${CLAUDE_PLUGIN_ROOT}').join(PLUGIN)], { cwd: repo, input: STOP_INPUT, encoding: 'utf8', env: { PATH: [lyngo.dir, '/bin'].join(':'), CLAUDE_PROJECT_DIR: repo } });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout + r.stderr, '');
+  }
+  assert.deepEqual(lyngo.runs(), []);
+});
+
+test('the plugin\'s Stop hook runs lyngo localize --hook once in a Lyngo project, with Claude Code\'s JSON on stdin, in the project where the session started', () => {
+  const lyngo = stubLyngo();
+  const repo = makeRepo();
+  g(repo, 'config', '--local', 'lyngo.project', 'true');
+  const r = pluginHook('Stop', { cwd: repo, projectDir: repo, pathDirs: [lyngo.dir], input: STOP_INPUT });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, '{"systemMessage":"Lyngo: stub"}\n', 'the CLI\'s JSON reaches Claude Code as is');
+  assert.deepEqual(lyngo.runs(), ['lyngo localize --hook']);
+  assert.ok(fs.readFileSync(lyngo.log, 'utf8').includes(STOP_INPUT), 'stdin reaches the CLI');
+  // The agent works in another folder: the project is where the session started.
+  const elsewhere = path.join(scratch, 'elsewhere');
+  fs.mkdirSync(elsewhere);
+  assert.equal(pluginHook('Stop', { cwd: elsewhere, projectDir: repo, pathDirs: [lyngo.dir], input: STOP_INPUT }).status, 0);
+  assert.equal(lyngo.runs().length, 2);
+  // A session that started in another folder does not run in this repository.
+  assert.equal(pluginHook('Stop', { cwd: repo, projectDir: elsewhere, pathDirs: [lyngo.dir], input: STOP_INPUT }).stdout, '');
+  assert.equal(lyngo.runs().length, 2);
+  // A worktree of the repository is a Lyngo project too: the marker is in the shared config.
+  const tree = path.join(scratch, 'tree');
+  g(repo, 'worktree', 'add', '-q', tree);
+  assert.equal(pluginHook('Stop', { cwd: tree, projectDir: tree, pathDirs: [lyngo.dir], input: STOP_INPUT }).status, 0);
+  assert.equal(lyngo.runs().length, 3);
+});
+
+test('the plugin\'s Stop hook leaves the stop to the settings hook an earlier init wrote, and a permission rule does not count as one', () => {
+  const lyngo = stubLyngo();
+  const repo = makeRepo();
+  g(repo, 'config', '--local', 'lyngo.project', 'true');
+  fs.mkdirSync(path.join(repo, '.claude'));
+  const stopHook = (command) => ({ hooks: { Stop: [{ hooks: [{ type: 'command', command }] }] } });
+  for (const [file, settings, indent] of [
+    ['settings.local.json', stopHook(HOOK), 2],
+    ['settings.local.json', stopHook(HOOK_024), 2],
+    ['settings.local.json', stopHook('lyngo localize 2>&1 | tail -20'), 0],
+    ['settings.json', stopHook(HOOK), 2],
+  ]) {
+    fs.writeFileSync(path.join(repo, '.claude', file), JSON.stringify(settings, null, indent));
+    const r = pluginHook('Stop', { cwd: repo, projectDir: repo, pathDirs: [lyngo.dir], input: STOP_INPUT });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout + r.stderr, '', file);
+    fs.rmSync(path.join(repo, '.claude', file));
+  }
+  assert.deepEqual(lyngo.runs(), []);
+  fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({ permissions: { allow: ['Bash(lyngo localize:*)', 'Bash(lyngo localize --hook)'] }, hooks: { Stop: [{ hooks: [{ type: 'command', command: 'echo bye' }] }] } }, null, 2));
+  assert.equal(pluginHook('Stop', { cwd: repo, projectDir: repo, pathDirs: [lyngo.dir], input: STOP_INPUT }).status, 0);
+  assert.deepEqual(lyngo.runs(), ['lyngo localize --hook']);
+});
+
+test('the plugin\'s Stop hook in a Lyngo project says in valid JSON when the CLI is not on PATH', () => {
+  const repo = makeRepo();
+  g(repo, 'config', '--local', 'lyngo.project', 'true');
+  const r = pluginHook('Stop', { cwd: repo, projectDir: repo, input: STOP_INPUT });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), { systemMessage: 'Lyngo: the CLI is not on PATH. Install it: npm i -g @prettifystudio/lyngo-cli' });
+});
+
+test('the plugin\'s SessionStart hook sets LYNGO_PLUGIN_HOOK=1 for the session\'s commands, prints nothing, and does nothing without CLAUDE_ENV_FILE', () => {
+  const envFile = path.join(scratch, 'session-env.sh');
+  fs.writeFileSync(envFile, 'export OTHER=1\n');
+  const r = pluginHook('SessionStart', { env: { CLAUDE_ENV_FILE: envFile } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout + r.stderr, '', 'a SessionStart hook\'s stdout goes to the model');
+  assert.equal(fs.readFileSync(envFile, 'utf8'), 'export OTHER=1\nexport LYNGO_PLUGIN_HOOK=1\n');
+  assert.equal(execFileSync('/bin/sh', ['-c', `. "${envFile}"; ${JSON.stringify(process.execPath)} -e 'process.stdout.write(process.env.LYNGO_PLUGIN_HOOK)'`], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } }), '1');
+  const none = pluginHook('SessionStart');
+  assert.equal(none.status, 0, none.stderr);
+  assert.equal(none.stdout + none.stderr, '');
+});
+
+test('a command the server answers for the repository sets the marker for the plugin\'s hook; a refused one does not', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  reset({ mcpFail: [404, { error: 'no_project', message: 'No Lyngo project for this repository. Run lyngo init.' }] });
+  assert.equal((await run(['status'], { cwd: repo })).code, 1);
+  assert.equal(spawnSync('git', ['config', '--local', '--get', 'lyngo.project'], { cwd: repo }).status, 1, 'no project, no marker');
+  reset();
+  const r = await run(['status'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(g(repo, 'config', '--local', '--get', 'lyngo.project'), 'true\n');
+  // It survives git reset --hard and git clean, and the working tree stays clean.
+  g(repo, 'reset', '-q', '--hard');
+  g(repo, 'clean', '-qfdx');
+  assert.equal(g(repo, 'config', '--local', '--get', 'lyngo.project'), 'true\n');
+  assert.equal(g(repo, 'status', '--porcelain'), '');
+});
+
+test('lookup prints one line per text: key exists, similar keys, refused, the languages that have it', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const r = await run(['lookup', 'Save', 'save.', 'Admin', 'Hello there'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout, [
+    '"Save": key exists; translated: fr',
+    '"save.": no key; similar keys: "Save"',
+    '"Admin": refused: leave it as written',
+    '"Hello there": no key',
+    '',
+  ].join('\n'));
+  const c = calls.find((x) => x.path === '/mcp/admin');
+  assert.deepEqual(c.body.params, { name: 'lookup', arguments: { texts: ['Save', 'save.', 'Admin', 'Hello there'] } });
+  const none = await run(['lookup'], { cwd: repo });
+  assert.equal(none.code, 1);
+  assert.match(none.stderr, /usage: lyngo lookup/);
 });
 
 test('init does not warn when the branch is pushed and package.json is clean', async () => {

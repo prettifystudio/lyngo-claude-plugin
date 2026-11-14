@@ -33,7 +33,11 @@ lyngo init           # project, i18n setup, languages, agent hook
    browser (in a terminal it asks first) and waits until you have added it: up
    to 10 minutes in a terminal, 9 minutes for an agent or a script. Then it
    continues by itself. When `CI` is set, or with `--no-wait`, it does not wait:
-   it stops with exit code 3, and the next run continues.
+   it stops with exit code 3, and the next run continues. With the project, it
+   marks the repository as a Lyngo project: `lyngo.project = true` in the repository's
+   git config (`.git/config`, never committed). The plugin's Stop hook reads
+   it, and does nothing in other repositories. Every other command that the
+   server answers for the repository sets it too.
 3. Detects the framework and the i18n library.
 4. Sets the languages: `--languages fr,de`, or it asks.
 5. Applies the i18n setup as a patch to your working tree. When the patch
@@ -43,11 +47,14 @@ lyngo init           # project, i18n setup, languages, agent hook
    command instead of running it.
 6. When Claude Code is installed: registers the Lyngo MCP server for this
    repository in Claude Code's local scope (stored in your home folder, never in
-   the repository), and adds one Stop hook to `.claude/settings.local.json` that
-   runs `lyngo localize --hook` when your agent finishes a task. A Claude Code
-   session that is open does not load them: when init adds them, it says to
-   restart Claude Code in the repository. Exit, then run `claude --continue` to
-   keep the conversation.
+   the repository). Claude Code loads it when the next session starts. Until
+   then, the agent uses `lyngo status`, `lyngo lookup` and `lyngo check`. The
+   Stop hook runs `lyngo localize --hook` when your agent finishes a task. It
+   comes with the Claude Code plugin (see below): a session that has the plugin
+   runs it from the first stop after init, with no restart. Without the plugin,
+   init adds the hook to `.claude/settings.local.json`; in an open Claude Code
+   session it then says to restart: exit, then run `claude --continue` to keep
+   the conversation. In a terminal, init never asks for a restart.
 
 Run it again at any time: it prints the state and changes nothing that is
 already set up.
@@ -89,6 +96,7 @@ already set up.
 | `lyngo localize` | Localizes and translates what changed in the working tree, as server jobs of up to 100 files. It sends the catalogs and Laravel's `lang/<code>/*.php` with the files, and prints what the server skipped or left untranslated. Flags: `--all` (the whole repository, in batches), `--languages`, `--no-translate`, `--dry`, `--hook` (the Claude Code Stop hook) |
 | `lyngo translate <code>…` | Fills every key a language's catalog lacks, from the primary catalog, as server jobs of 100 keys |
 | `lyngo check <file>` | The user-facing strings of one file |
+| `lyngo lookup <text>…` | For each text: the key exists, similar keys, refused, the languages that have it |
 | `lyngo status` | The project as Lyngo knows it |
 
 Configuration: `LYNGO_HOST` (default `https://lyngo.app`), `LYNGO_TOKEN`
@@ -98,15 +106,27 @@ one job, default 3900). Revoke tokens in Lyngo under Settings, CLI.
 ## The Claude Code plugin (optional)
 
 This repository is also a Claude Code plugin. It adds the commands
-`/lyngo:init`, `/lyngo:localize`, `/lyngo:status` and `/lyngo:login`, and the
+`/lyngo:init`, `/lyngo:localize`, `/lyngo:status` and `/lyngo:login`, the
 `lyngo-i18n` skill, which makes the agent check existing keys before it writes
-new text. It needs the `lyngo` command from npm; `lyngo init` prints these two
-lines when the plugin is not installed yet.
+new text, and the Stop hook. It needs the `lyngo` command from npm; `lyngo init`
+prints these two lines when the plugin is not installed yet.
 
 ```bash
 claude plugin marketplace add prettifystudio/lyngo-claude-plugin
 claude plugin install lyngo@lyngo
 ```
+
+Since 0.2.22 the plugin ships the Stop hook (`hooks/hooks.json`). Claude Code
+loads plugin hooks when a session starts, so the hook is already there when
+`lyngo init` runs in that session. It runs at every stop in every repository,
+and does something only where `lyngo.project` is set in the repository's git
+config. Outside a Lyngo project it runs one git command and prints nothing.
+When an earlier `lyngo init` put the Stop hook in `.claude/settings.local.json`,
+the plugin's hook leaves the stop to that one, so the hook runs once. The
+plugin's SessionStart hook sets `LYNGO_PLUGIN_HOOK=1` for the commands of the
+session: that is how `lyngo init` knows that the hook runs in this session.
+Both hooks are POSIX sh. On Windows, Claude Code runs them in Git Bash, which
+comes with Git for Windows.
 
 ## Other MCP clients
 
