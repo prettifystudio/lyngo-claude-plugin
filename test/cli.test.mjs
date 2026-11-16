@@ -2669,3 +2669,45 @@ test('a request the server refuses as too large (413, an HTML page or JSON) stop
   assert.equal(h.code, 0, h.out);
   assert.match(JSON.parse(h.stdout).systemMessage, /^Lyngo: the request is too large for the Lyngo server \(HTTP 413, \d+\.\d MB\)\. Send fewer files/);
 });
+
+// ── 0.2.24: warnings of one kind that each name one site are one line ──────
+
+const fieldConflict = (f) => `Validation field name: ${f} has different labels ("${f}" in resources/views/a.blade.php; "Your ${f}" in resources/views/b.blade.php), so it gets its generic name.`;
+const fixedLocale = (site, tail = "('en-US'). Dates there stay in that format in every language.") => `Formatting left as written, the locale is fixed in the code: ${site} ${tail}`;
+const mayBeStored = (site) => `Left as written, may be stored: ${site} 'Untitled'`;
+const rawEcho = (text) => `Left as written: text next to a raw echo, resources/views/x.blade.php:12: ${text}`;
+
+test('localize gives one line to the warnings of one kind that name one site each, in the order they first appear; a group is one line against the cap', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const sites = ['utils/formatDate.js:12', 'resources/js/Pages/Teams/Show.vue:138', ...[1, 2, 3, 4, 5].map((n) => `resources/js/a${n}.tsx:3`)];
+  const numbers = fixedLocale('resources/js/Pages/Teams/Show.vue:140', "('en'). Numbers there stay in that format in every language.");
+  const list = [
+    fieldConflict('email'), fixedLocale(sites[0]), fieldConflict('name'), fixedLocale(sites[1]), numbers,
+    mayBeStored('app/A.php:12'), mayBeStored('app/B.php:30'), fieldConflict('title'), fieldConflict('body'),
+    ...sites.slice(2).map((s) => fixedLocale(s)), rawEcho('Node.js'), rawEcho('Vue.js'),
+  ];
+  reset({ localizeReport: { warnings: list } });
+  const r = await run(['localize', '--dry'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(r.stdout.endsWith([
+    '  warnings (16):',
+    fieldConflict('email'),
+    `Formatting left as written, the locale is fixed in the code (7): ${sites.join(', ')} ('en-US'). Dates there stay in that format in every language.`,
+    fieldConflict('name'), numbers,
+    // A snippet after the site, or a site before the last ": ", never groups.
+    mayBeStored('app/A.php:12'), mayBeStored('app/B.php:30'),
+    fieldConflict('title'), fieldConflict('body'), rawEcho('Node.js'), rawEcho('Vue.js'),
+  ].map((l, i) => (i ? '    ' + l : l)).join('\n') + '\n'), r.stdout);
+});
+
+test('translate groups its warnings the same way', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), '{"Hello": "Hello"}\n');
+  reset({ translateReport: { warnings: ['mixed-language source: resources/views/a.blade.php:3', 'Machine text kept in the catalog: Key 3', 'mixed-language source: resources/js/B.vue:9'] } });
+  const r = await run(['translate', 'fr'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /\n {2}warnings \(3\):\n {4}mixed-language source \(2\): resources\/views\/a\.blade\.php:3, resources\/js\/B\.vue:9\n {4}Machine text kept in the catalog: Key 3\n$/);
+});

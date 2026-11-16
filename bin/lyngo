@@ -851,9 +851,30 @@ const WARNINGS_SHOWN = 10;
 function warningLines(warnings) {
   const list = [...warnings];
   if (!list.length) return [];
-  const out = [`  warnings (${list.length}):`, ...list.slice(0, WARNINGS_SHOWN).map((w) => `    ${w}`)];
-  if (list.length > WARNINGS_SHOWN) out.push(`    … and ${list.length - WARNINGS_SHOWN} more`);
+  const lines = groupedWarnings(list);
+  const out = [`  warnings (${list.length}):`, ...lines.slice(0, WARNINGS_SHOWN).map((w) => `    ${w}`)];
+  if (lines.length > WARNINGS_SHOWN) out.push(`    … and ${lines.length - WARNINGS_SHOWN} more`);
   return out;
+}
+
+// Warnings of one kind that each name one site ("<kind>: <path:line>", maybe a
+// "(detail)" after it) give one line that lists every site, so the cap hides no site.
+// Two warnings are of one kind when the text before the site and the text after
+// it are the same. A site has a "/" or a line number; a quoted snippet after it,
+// or a site that ends the text before the last ": " (a Blade line, a kept value),
+// never groups.
+function groupedWarnings(list) {
+  const groups = new Map();
+  for (const w of list) {
+    const at = w.lastIndexOf(': ');
+    const before = w.slice(0, at);
+    const m = at > 0 && !/\S\.\w+(?::\d+)?$/.test(before) ? /^(\S+\.\w+(?::\d+)?)( \(.*)?$/.exec(w.slice(at + 2)) : null;
+    const site = m && /[/:]/.test(m[1]) ? m : null;
+    const key = site ? `${before}\0${site[2] || ''}` : `\0${w}`;
+    if (!groups.has(key)) groups.set(key, { text: w, before, tail: site ? site[2] || '' : '', sites: [] });
+    groups.get(key).sites.push(site ? site[1] : w);
+  }
+  return [...groups.values()].map((g) => (g.sites.length > 1 ? `${g.before} (${g.sites.length}): ${g.sites.join(', ')}${g.tail}` : g.text));
 }
 
 // The values the verifier flagged: one line each, where the code shows the key
