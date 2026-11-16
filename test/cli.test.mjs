@@ -174,6 +174,14 @@ function handle(req, body) {
     });
     return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
   }
+  if (key === 'POST /mcp/admin' && body.params.name === 'localize' && state.localizeBatch) {
+    // The server's files per job: the first state.localizeBatch files sent are localized (state.localized), the rest deferred.
+    const { files } = body.params.arguments;
+    const done = files.slice(0, state.localizeBatch).map((f) => f.path);
+    state.localized.push(...done);
+    const text = JSON.stringify({ patch: '', report: { files: done.map((p) => ({ path: p, wrapped: [] })), primary: { added: [], already_there: [] }, languages: {}, ...(state.localizeReport || {}) }, deferred: files.slice(state.localizeBatch).map((f) => f.path) });
+    return [200, { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text }] } }];
+  }
   if (key === 'POST /mcp/admin' && body.params.name === 'localize') {
     const text = JSON.stringify({
       patch: state.localizePatch || ['diff --git a/resources/js/Hello.tsx b/resources/js/Hello.tsx', '--- a/resources/js/Hello.tsx', '+++ b/resources/js/Hello.tsx', '@@ -1 +1 @@', "-export const Hello = () => <p>Hello</p>;", "+export const Hello = () => <p>{t('Hello')}</p>;", ''].join('\n'),
@@ -2552,4 +2560,112 @@ test('localize --all sends the untracked source files git does not ignore, once 
   const sel = mcpCalls().find((c) => c.body.params.name === 'select_files');
   assert.deepEqual(sel.body.params.arguments.paths, ['resources/js/app.ts', 'resources/js/components/LanguageSwitcher.tsx']);
   assert.deepEqual(localizeCalls()[0].body.params.arguments.files.map((f) => f.path), ['resources/js/app.ts', 'resources/js/components/LanguageSwitcher.tsx']);
+});
+
+// ── 0.2.23: the validation field names line; a localize request stays within 20 MB ──
+
+const FIELDS = { added: { fr: 29, de: 29, es: 29, en: 9 }, line: 'Validation field names: 29 added in fr, de, es; 9 in en.' };
+
+test('localize prints the server\'s validation field names line with the summary, and the hook gives it to the agent in its one JSON object', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  reset({ localizeReport: { validation_attributes: FIELDS } });
+  let r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /\n {2}fr: 1 translated, 0 from memory\n {2}Validation field names: 29 added in fr, de, es; 9 in en\.\n/);
+
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'export const Hello = () => <p>Hello</p>;\n');
+  r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout.trim().split('\n').length, 1, 'one line on stdout');
+  assert.match(JSON.parse(r.stdout).hookSpecificOutput.additionalContext, /\n {2}fr: 1 translated, 0 from memory\n {2}Validation field names: 29 added in fr, de, es; 9 in en\.\n/);
+});
+
+test('localize sums the validation field names of several batches per language into one line', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  for (const n of ['A', 'B', 'C', 'D']) fs.writeFileSync(path.join(repo, 'resources', 'js', n + '.tsx'), `export const ${n} = () => <p>${n}</p>;\n`);
+  reset({ localizeBatch: 2, localized: [], localizeReport: { validation_attributes: { added: { fr: 2, de: 2, en: 1 }, line: 'Validation field names: 2 added in fr, de; 1 in en.' } } });
+  const r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(localizeCalls().length, 3);
+  assert.equal(r.stdout.match(/Validation field names/g).length, 1);
+  assert.match(r.stdout, /\n {2}Validation field names: 6 added in fr, de; 3 in en\.\n/);
+});
+
+const BUDGET = 20 * 1024 * 1024;
+const jsonBytes = (v) => Buffer.byteLength(JSON.stringify(v));
+const requestBytes = (c) => { const a = c.body.params.arguments; return jsonBytes(a.files) + jsonBytes(a.catalogs) + (a.context ? jsonBytes(a.context) : 0); };
+
+test('localize --all under 20 MB sends every remaining file whole in each request, as before', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  for (const n of ['A', 'B', 'C', 'D']) fs.writeFileSync(path.join(repo, 'resources', 'js', n + '.tsx'), `export const ${n} = () => <p>${n}</p>;\n`);
+  reset({ localizeBatch: 2, localized: [] });
+  const r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const js = (...names) => names.map((n) => `resources/js/${n}`);
+  assert.deepEqual(localizeCalls().map((c) => c.body.params.arguments.files.map((f) => f.path)), [js('A.tsx', 'B.tsx', 'C.tsx', 'D.tsx', 'app.ts'), js('C.tsx', 'D.tsx', 'app.ts'), js('app.ts')]);
+  assert.equal(localizeCalls()[0].body.params.arguments.files[3].content, 'export const D = () => <p>D</p>;\n');
+});
+
+test('localize --all over 20 MB sends only the next batch whole: each request stays within 20 MB, at most 100 files, and every file is localized once', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  const small = Array.from({ length: 120 }, (_, i) => `resources/js/a/S${String(i).padStart(3, '0')}.tsx`);
+  const big = ['resources/js/b/Big0.tsx', 'resources/js/b/Big1.tsx', 'resources/js/b/Big2.tsx'];
+  fs.mkdirSync(path.join(repo, 'resources', 'js', 'a'));
+  fs.mkdirSync(path.join(repo, 'resources', 'js', 'b'));
+  for (const p of small) fs.writeFileSync(path.join(repo, p), 'export const A = () => <p>A</p>;\n');
+  // 9 MB on disk, 10.7 MB as JSON (quotes and line ends are escaped): two fit by size on disk, not as JSON.
+  const line = 'const a = "x";\n';
+  for (const p of big) fs.writeFileSync(path.join(repo, p), line.repeat((9 * 1024 * 1024) / line.length));
+  // The server localizes 90 files of a call: 10 of the first 100 come back deferred, before the files not sent yet.
+  reset({ localizeBatch: 90, localized: [] });
+  const r = await run(['localize', '--all'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const locs = localizeCalls();
+  for (const c of locs) assert.ok(requestBytes(c) <= BUDGET, `a request of ${requestBytes(c)} bytes`);
+  assert.deepEqual(locs.map((c) => c.body.params.arguments.files.length), [100, 32, 1, 1]);
+  assert.deepEqual(locs[1].body.params.arguments.files.slice(0, 10).map((f) => f.path), small.slice(90, 100));
+  assert.deepEqual(locs.slice(2).map((c) => c.body.params.arguments.files[0].path), big.slice(1));
+  assert.equal(locs[2].body.params.arguments.files[0].content, fs.readFileSync(path.join(repo, big[1]), 'utf8'), 'a file goes whole');
+  assert.deepEqual([...state.localized].sort(), [...small, 'resources/js/app.ts', ...big].sort());
+  assert.match(r.stdout, /batch 4: 124\/124 files/);
+});
+
+test('the context sent back for "needs" stays within the 20 MB too: a file that does not fit is left out', async () => {
+  loggedIn();
+  const repo = needsRepo();
+  const ctx = Array.from({ length: 41 }, (_, i) => `app/Ctx/C${String(i).padStart(2, '0')}.php`);
+  fs.mkdirSync(path.join(repo, 'app', 'Ctx'));
+  for (const p of ctx) fs.writeFileSync(path.join(repo, p), '<?php\n' + 'a'.repeat(500 * 1024));
+  g(repo, 'add', 'app/Ctx');
+  g(repo, 'commit', '-q', '-m', 'ctx');
+  reset({ localizeNeeds: ctx });
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  const [first, retry, ...more] = localizeCalls();
+  assert.equal(more.length, 0);
+  assert.equal(first.body.params.arguments.context, undefined);
+  assert.ok(requestBytes(retry) <= BUDGET, `a request of ${requestBytes(retry)} bytes`);
+  assert.deepEqual(retry.body.params.arguments.context.map((f) => f.path), ctx.slice(0, 40));
+});
+
+test('a request the server refuses as too large (413, an HTML page or JSON) stops with one clear line, never the page', async () => {
+  loggedIn();
+  const repo = helloRepo();
+  const LINE = /^lyngo: the request is too large for the Lyngo server \(HTTP 413, \d+\.\d MB\)\. Send fewer files in one run, and keep very large files \(generated code, data\) out of the source folders\.\n$/;
+  for (const over of [{ faults: [null, 413] }, { mcpFail: [413, { message: 'The POST data is too large.' }] }]) {
+    reset(over);
+    const r = await run(['localize'], { cwd: repo });
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, LINE);
+    assert.doesNotMatch(r.out, /<html>|POST data/);
+    assert.equal(fs.readFileSync(path.join(repo, 'resources', 'js', 'Hello.tsx'), 'utf8'), 'export const Hello = () => <p>Hello</p>;\n');
+  }
+  reset({ faults: [null, 413] });
+  const h = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(h.code, 0, h.out);
+  assert.match(JSON.parse(h.stdout).systemMessage, /^Lyngo: the request is too large for the Lyngo server \(HTTP 413, \d+\.\d MB\)\. Send fewer files/);
 });

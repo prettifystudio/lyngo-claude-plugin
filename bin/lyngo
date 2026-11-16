@@ -294,6 +294,8 @@ async function request(method, url, { body, auth = true, accept = 'application/j
     const minimum = res.headers.get('x-lyngo-cli-minimum');
     throw new CliTooOld(data.message || `this lyngo CLI (${VERSION}) is too old${minimum ? `; Lyngo needs ${minimum} or newer` : ''}. Update it: ${UPDATE_COMMAND}`);
   }
+  // nginx refuses a body over its limit (35 MB on lyngo.app) with an HTML page, before the server reads it.
+  if (res.status === 413) fail(`the request is too large for the Lyngo server (HTTP 413, ${(Buffer.byteLength(payload || '') / 1048576).toFixed(1)} MB). Send fewer files in one run, and keep very large files (generated code, data) out of the source folders.`);
   if (auth && res.status === 401) fail('the token was refused (revoked or expired). Run lyngo login.');
   if (res.status === 429) fail('too many calls. Wait a minute and try again.');
   return { status: res.status, data };
@@ -1106,6 +1108,16 @@ function gitBlob(content) {
   return crypto.createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
 }
 
+// A localize request is at most 20 MB of files, catalogs and context, counted as
+// JSON: lyngo.app's nginx refuses a request over 35 MB (HTTP 413) before PHP
+// runs. Up to the budget every remaining file goes whole, as before, and the
+// server reads the ones it defers as cross-file context. Above it only the next
+// batch goes, at most the server's files per job; the server reads the rest from
+// GitHub and asks for newer working-tree copies in "needs".
+const PAYLOAD_BUDGET = 20 * 1024 * 1024;
+const JOB_MAX_FILES = 100; // LocalizeTool::JOB_MAX_FILES on the server
+const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value));
+
 // The paths a localize answer listed in "needs", read from the repository as
 // {path, content}: only source files (SRC, not SKIP, never .env or keys),
 // relative paths that stay inside it (no symlink out),
@@ -1114,15 +1126,17 @@ function gitBlob(content) {
 // "needs_sha" names the blob the server read a path at (a file a cross-file
 // decision read, 0.2.18): a copy with that blob is what the server read, so it
 // is left out. The copy is the one an earlier batch sent (before its patch), else the disk's.
+// A context file that does not fit in the room the request has left (PAYLOAD_BUDGET) is left out too.
 const CONTEXT_MAX_FILES = 50;
 const CONTEXT_MAX_BYTES = 512 * 1024;
-function contextFiles(top, needs, payload, notUtf8, needsSha = {}, sentBlobs = new Map()) {
+function contextFiles(top, needs, payload, notUtf8, needsSha = {}, sentBlobs = new Map(), room = Infinity) {
   if (!Array.isArray(needs)) return [];
   const sent = new Set(payload.map((f) => f.path));
   const readAt = needsSha && typeof needsSha === 'object' ? needsSha : {};
   let realTop;
   try { realTop = fs.realpathSync(top); } catch { return []; }
   const out = [];
+  let left = room - 2; // the brackets of the list
   for (const p of new Set(needs)) {
     if (out.length >= CONTEXT_MAX_FILES) break;
     if (typeof p !== 'string' || p === '' || sent.has(p) || p.includes('\0') || path.isAbsolute(p) || /^[A-Za-z]:/.test(p) || !SRC.test(p) || SKIP.test(p) || p.split(/[\\/]/).includes('..')) continue;
@@ -1135,6 +1149,9 @@ function contextFiles(top, needs, payload, notUtf8, needsSha = {}, sentBlobs = n
       if (typeof readAt[p] === 'string' && (sentBlobs.get(p) || gitBlob(bytes)) === readAt[p]) continue;
       const content = utf8(bytes);
       if (content === null) { if (notUtf8) notUtf8.add(p); continue; }
+      const size = jsonBytes({ path: p, content }) + 1; // and its comma
+      if (size > left) continue;
+      left -= size;
       out.push({ path: p, content });
     } catch { /* missing or unreadable: left out */ }
   }
@@ -1223,6 +1240,13 @@ function applyPatch(patch) {
 const ENUM_PARTS = [['enums_added', 'enum', 'enums'], ['resource', 'resource', 'resources'], ['prop', 'prop', 'props'], ['text', 'sentence', 'sentences'], ['blade', 'view', 'views'], ['livewire', 'Livewire view', 'Livewire views'], ['table', 'table column', 'table columns'], ['components', 'frontend read', 'frontend reads'], ['types', 'type', 'types'], ['filament', 'Filament label', 'Filament labels']];
 function enumLabelParts(counts) {
   return ENUM_PARTS.filter(([k]) => counts[k] > 0).map(([k, one, many]) => `${counts[k]} ${counts[k] === 1 ? one : many}`);
+}
+
+// The server's ValidationAttributes::line: "Validation field names: 29 added in fr, de, es; 9 in en."
+function fieldNamesLine(added) {
+  const groups = new Map();
+  for (const [code, n] of Object.entries(added)) groups.set(n, [...(groups.get(n) || []), code]);
+  return 'Validation field names: ' + [...groups].sort((a, b) => b[0] - a[0]).map(([n, codes], i) => `${n} ${i ? 'in' : 'added in'} ${codes.join(', ')}`).join('; ') + '.';
 }
 
 // The files a frontend build bundles, and the package manager the lockfile at the top names (npm when none).
@@ -1319,7 +1343,7 @@ async function localize(opts) {
   if (opts.all) say(`lyngo: localizing ${total} file${total === 1 ? '' : 's'} in batches; each batch applies before the next.`);
   // Progress while a job runs goes to the terminal; the hook keeps its output to the report.
   const progress = opts.hook ? null : (line) => console.log(line);
-  const report = { files: [], added: [], reused: [], languages: {}, missing: new Set(), skipped: [], untranslated: {}, notes: [], warnings: new Set(), laravelLang: [] };
+  const report = { files: [], added: [], reused: [], languages: {}, missing: new Set(), skipped: [], untranslated: {}, notes: [], warnings: new Set(), laravelLang: [], fieldNames: {}, fieldLines: [] };
   let batch = 0;
   let patched = false;
   let gotPatch = false; // a patch came back (applied, or printed by --dry)
@@ -1330,9 +1354,23 @@ async function localize(opts) {
   while (files.length) {
     batch++;
     const payload = [];
-    for (const p of files) { const c = readIfFile(p, notUtf8); if (c !== null) { payload.push({ path: p, content: c }); sentBlobs.set(p, gitBlob(c)); } }
+    for (const p of files) { const c = readIfFile(p, notUtf8); if (c !== null) payload.push({ path: p, content: c }); }
     if (payload.length === 0) break;
     const args = { files: payload, catalogs: catalogsNow(), format: 'patch' };
+    let size = jsonBytes(payload) + jsonBytes(args.catalogs);
+    let unsent = []; // over PAYLOAD_BUDGET: the files a later batch sends
+    if (size > PAYLOAD_BUDGET) {
+      size = jsonBytes(args.catalogs) + 2;
+      let n = 0;
+      for (const f of payload) {
+        const b = jsonBytes(f) + 1;
+        if (n >= JOB_MAX_FILES || (n > 0 && size + b > PAYLOAD_BUDGET)) break;
+        size += b;
+        n++;
+      }
+      unsent = payload.splice(n).map((f) => f.path);
+    }
+    for (const f of payload) sentBlobs.set(f.path, gitBlob(f.content));
     if (opts.languages) args.languages = opts.languages.filter((l) => l !== status.primary_language);
     // --no-translate: keys only, catalogs for translators. Without the flag the project's setting decides.
     if (opts['no-translate']) args.translate = false;
@@ -1342,7 +1380,7 @@ async function localize(opts) {
     // vito 2026-11-08). That answer is not applied: the batch goes once more
     // with those files from disk as read-only context. Older servers never send it.
     // A file whose blob is the one the server read (needs_sha) is left out; none left, the answer applies.
-    const context = contextFiles(top, r.needs, payload, notUtf8, r.needs_sha, sentBlobs);
+    const context = contextFiles(top, r.needs, payload, notUtf8, r.needs_sha, sentBlobs, PAYLOAD_BUDGET - size);
     if (context.length) {
       if (progress) progress(`  ... sending ${context.length} file${context.length === 1 ? '' : 's'} the server reads from this working tree, and the batch again`);
       r = await callJob('localize', { ...args, context }, progress);
@@ -1387,12 +1425,17 @@ async function localize(opts) {
     }
     report.skipped.push(...(r.report?.skipped || []));
     report.laravelLang.push(...(r.report?.laravel_lang || []));
+    const fields = r.report?.validation_attributes;
+    if (fields?.line) {
+      report.fieldLines.push(String(fields.line));
+      for (const [code, n] of Object.entries(fields.added || {})) if (typeof n === 'number') report.fieldNames[code] = (report.fieldNames[code] || 0) + n;
+    }
     for (const w of r.report?.warnings || []) report.warnings.add(String(w));
     for (const [k, v] of Object.entries(r.report?.enum_labels?.counts || {})) if (typeof v === 'number') enumCounts[k] = (enumCounts[k] || 0) + v;
     // What the server says beyond the steps this CLI takes itself (apply, call again).
     const note = String(r.next || '').replace(/Apply the patch, then call again with the files in "deferred"\.|Apply the patch with git apply, then show the user the report\./g, '').trim();
     if (note && !report.notes.includes(note)) report.notes.push(note);
-    files = r.deferred || [];
+    files = [...(r.deferred || []), ...unsent];
     if (opts.all) {
       const done = total - files.length;
       const got = (r.report?.files || []).reduce((n, f) => n + (f.wrapped?.length || 0), 0);
@@ -1418,6 +1461,9 @@ async function localize(opts) {
     say(`  ${code}: ${l.translated} translated, ${l.from_memory} from memory${flagged}`);
     for (const line of flaggedLines(l.flagged)) say(line);
   }
+  // The server's line; for several batches, the same line over their summed counts.
+  const fieldLine = report.fieldLines.length > 1 ? fieldNamesLine(report.fieldNames) : report.fieldLines[0];
+  if (fieldLine) say(`  ${fieldLine}`);
   if (report.missing.size) say(`  path keys no catalog holds: ${[...report.missing].slice(0, 6).map((k) => JSON.stringify(k)).join(', ')}${report.missing.size > 6 ? ', …' : ''}`);
   for (const [code, keys] of Object.entries(report.untranslated)) say(`  ${code}: ${keys.length} key${keys.length === 1 ? '' : 's'} not translated yet (${keys.slice(0, 3).map((k) => JSON.stringify(k)).join(', ')}${keys.length > 3 ? ', …' : ''}): run lyngo translate ${code}`);
   for (const sk of report.skipped) say(`  skipped ${sk.path}: ${sk.reason}`);
