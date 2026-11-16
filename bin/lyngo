@@ -1622,7 +1622,7 @@ const HELP = `lyngo ${VERSION}: localization for your repository, from the termi
   lyngo localize [--all] [--languages fr,de] [--no-translate] [--dry] [--hook]
                                     localize what changed in the working tree, and translate it
                                     (--no-translate: keys only; the project setting "Translate when localizing" is the default)
-                                    (--all: the whole repository instead of the changed files, in batches of 30)
+                                    (--all: the whole repository instead of the changed files, in batches of up to 100)
                                     (--hook: the Claude Code Stop hook; one JSON object, only files changed since the last run)
                                     (one Lyngo run at a time per repository: a run started by hand waits up to 2 minutes, the hook skips)
   lyngo translate <code> [<code>…]  fill every key a language's catalog lacks, from the primary catalog
