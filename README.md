@@ -96,7 +96,7 @@ already set up.
 | `lyngo localize` | Localizes and translates what changed in the working tree, as server jobs of up to 100 files. It sends the catalogs and Laravel's `lang/<code>/*.php` with the files, and prints what the server skipped or left untranslated. Flags: `--all` (the whole repository, in batches), `--languages`, `--no-translate`, `--dry`, `--hook` (the Claude Code Stop hook) |
 | `lyngo translate <code>…` | Fills every key a language's catalog lacks, from the primary catalog, as server jobs of 100 keys |
 | `lyngo check <file>` | The user-facing strings of one file |
-| `lyngo lookup <text>…` | For each text: the key exists, similar keys, refused, the languages that have it |
+| `lyngo lookup <text>…` | For each text: the key exists, similar keys, refused, the languages that have it. It reads the working tree's JSON catalogs first, so a key a run added and nobody pushed yet counts |
 | `lyngo status` | The project as Lyngo knows it |
 
 Configuration: `LYNGO_HOST` (default `https://lyngo.app`), `LYNGO_TOKEN`

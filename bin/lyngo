@@ -843,22 +843,30 @@ async function fillMissingCatalogs(project, opts) {
 }
 
 function catalogFolder(project) { return ((project.i18n && project.i18n.catalog_folder) || 'lang').replace(/\/+$/, ''); }
+// Both JSON catalog folders: Laravel's lang and the frontend's own, in the order the server merges them.
+const catalogFolders = (i18n) => [...new Set([i18n?.catalog_folder || 'lang', i18n?.js_catalog_folder].filter(Boolean).map((f) => f.replace(/\/+$/, '')))];
 function parseCatalog(p) { try { return JSON.parse(readIfFile(p) || ''); } catch { return null; } }
-
-// The server's warnings: texts left as written, values a database may store,
-// machine text kept in a catalog. Capped, so a long --all run stays readable.
-const WARNINGS_SHOWN = 10;
-function warningLines(warnings) {
-  const list = [...warnings];
-  if (!list.length) return [];
-  const lines = groupedWarnings(list);
-  const out = [`  warnings (${list.length}):`, ...lines.slice(0, WARNINGS_SHOWN).map((w) => `    ${w}`)];
-  if (lines.length > WARNINGS_SHOWN) out.push(`    … and ${lines.length - WARNINGS_SHOWN} more`);
+// A catalog's keys as the server reads them: nested keys joined with dots, string values only.
+function flatCatalog(data, prefix = '', out = {}) {
+  for (const [k, v] of Object.entries(data && typeof data === 'object' ? data : {})) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === 'object') flatCatalog(v, key, out);
+    else if (typeof v === 'string' && !Object.hasOwn(out, key)) out[key] = v;
+  }
   return out;
 }
 
+// The server's warnings: texts left as written, values a database may store,
+// machine text kept in a catalog. Every one is printed: they are the report, and
+// a cut part was lost (ai-planforge, 2026-11-17: 10 of 20 shown, written nowhere).
+function warningLines(warnings) {
+  const list = [...warnings];
+  if (!list.length) return [];
+  return [`  warnings (${list.length}):`, ...groupedWarnings(list).map((w) => `    ${w}`)];
+}
+
 // Warnings of one kind that each name one site ("<kind>: <path:line>", maybe a
-// "(detail)" after it) give one line that lists every site, so the cap hides no site.
+// "(detail)" after it) give one line that lists every site, so a long run stays readable.
 // Two warnings are of one kind when the text before the site and the text after
 // it are the same. A site has a "/" or a line number; a quoted snippet after it,
 // or a site that ends the text before the last ": " (a Blade line, a kept value),
@@ -878,19 +886,15 @@ function groupedWarnings(list) {
 }
 
 // The values the verifier flagged: one line each, where the code shows the key
-// (file:line, when the server knows it) and why, in a few words. Capped too.
-// An older server sends the keys alone.
-const FLAGGED_SHOWN = 10;
+// (file:line, when the server knows it) and why, in a few words. Every one is
+// printed, as the warnings. An older server sends the keys alone.
 function flaggedLines(flagged) {
-  const list = [...flagged];
   const short = (k) => (k.length > 70 ? k.slice(0, 69) + '…' : k);
-  const out = list.slice(0, FLAGGED_SHOWN).map((f) => {
+  return [...flagged].map((f) => {
     if (typeof f !== 'object' || f === null) return `    ${JSON.stringify(short(String(f)))}`;
     const place = f.file ? `${f.file}${f.line ? `:${f.line}` : ''} ` : '';
     return `    ${place}${JSON.stringify(short(String(f.key)))}${f.reason ? `: ${f.reason}` : ''}`;
   });
-  if (list.length > FLAGGED_SHOWN) out.push(`    … and ${list.length - FLAGGED_SHOWN} more`);
-  return out;
 }
 
 // ── translate: fill a language's catalog from the primary one ─────────────
@@ -1339,7 +1343,7 @@ async function localize(opts) {
   // Both catalog folders (Laravel's lang and the frontend's own), read again
   // before EVERY call: a catalog the previous batch created must go back, or
   // the server diffs it as new twice (corp1, 2026-10-18: "already exists").
-  const folders = [...new Set([status.i18n?.catalog_folder || 'lang', status.i18n?.js_catalog_folder].filter(Boolean).map((f) => f.replace(/\/+$/, '')))];
+  const folders = catalogFolders(status.i18n);
   const isCatalog = (p) => folders.some((f) => p.startsWith(f + '/'));
   // Laravel's own lang/<code>/*.php go too: the server builds the PHP keys on
   // them and diffs against them, or a second run writes them again as new
@@ -1520,6 +1524,16 @@ async function localize(opts) {
 // a "block" decision shows as an error, any other code as a hook error.
 const HOOK_CLIP = 7000; // each field is capped at 10,000 characters, and JSON escaping adds some
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+// The report for the agent. One past the clip is written whole to a file the
+// agent names to the user, so no warning or flagged key is lost.
+function hookReport(lines) {
+  const text = lines.join('\n');
+  if (text.length <= HOOK_CLIP) return text;
+  const file = path.join(os.tmpdir(), `lyngo-report-${Date.now()}.txt`);
+  fs.writeFileSync(file, text + '\n');
+  const tail = `\n\nThe report is cut here. The whole report is in ${file}: give the user that path.`;
+  return clip(text, HOOK_CLIP - tail.length) + tail;
+}
 function hookOut(systemMessage, context) {
   // The update line goes with the report, never alone: it does not wake the agent by itself.
   const notice = updateNotice();
@@ -1570,7 +1584,7 @@ async function localizeHook(opts) {
   if (!r.patched) {
     const checked = r.sent ? `checked ${n(r.sent, 'file')}, nothing to localize` : '';
     if (!problems) { hookOut(`Lyngo: ${checked}`); return; }
-    hookOut(`Lyngo: ${[checked, problems].filter(Boolean).join('; ')}`, clip(r.lines.join('\n'), HOOK_CLIP) + '\n\nLyngo changed no file.' + tellProblems);
+    hookOut(`Lyngo: ${[checked, problems].filter(Boolean).join('; ')}`, hookReport(r.lines) + '\n\nLyngo changed no file.' + tellProblems);
     return;
   }
   const langs = Object.entries(r.byLanguage)
@@ -1584,7 +1598,7 @@ async function localizeHook(opts) {
     : `${what} changed${enumMark}${r.added ? `, ${n(r.added, 'new key')}` : ''}`;
   hookOut(
     `Lyngo: ${head}${langs.length ? '; ' + langs.join('; ') : ''}${problems ? '; ' + problems : ''}`,
-    clip(r.lines.join('\n'), HOOK_CLIP) + '\n\nLyngo has already updated these files and the catalogs on disk. Tell the user in one or two sentences what Lyngo changed. Do not edit those files or the catalogs again. If the user checks the page, rebuild the frontend first.' + tellProblems,
+    hookReport(r.lines) + '\n\nLyngo has already updated these files and the catalogs on disk. Tell the user in one or two sentences what Lyngo changed. Do not edit those files or the catalogs again. If the user checks the page, rebuild the frontend first.' + tellProblems,
   );
 }
 
@@ -1604,11 +1618,31 @@ async function check(file) {
 }
 
 // The MCP tool lookup, for a session that has not loaded the MCP server yet
-// (it loads when a session starts): one line per text.
+// (it loads when a session starts): one line per text. The server reads the
+// repository, so the working tree's JSON catalogs come first: a key a run added
+// and nobody pushed yet is only there (ai-planforge, 2026-11-17: "no key" for
+// "Preview", and the agent wrote a duplicate). A text the primary catalog holds
+// is answered from disk; the rest goes to the server, with the near matches on
+// disk added to its similar keys. Laravel's lang/<code>/*.php are not read: the
+// server's lookup does not read them either.
 async function lookup(texts) {
   if (!texts.length) fail('usage: lyngo lookup <text> [<text>…]  (quote each text)');
-  const r = await call('lookup', { texts });
-  for (const x of r.results || []) {
+  process.chdir(root());
+  const st = await call('status', {});
+  const primary = st.primary_language || 'en';
+  const catalogOf = (code) => Object.assign({}, ...catalogFolders(st.i18n).map((f) => flatCatalog(parseCatalog(path.join(f, code + '.json')))));
+  const local = catalogOf(primary);
+  const targets = (st.languages || []).filter((code) => code !== primary).map((code) => [code, catalogOf(code)]);
+  // The server's near match: case, outer spaces and trailing punctuation aside.
+  const norm = (t) => t.trim().replace(/[.!?:;…]+$/u, '').trim().toLowerCase();
+  const rest = texts.filter((t) => !Object.hasOwn(local, t));
+  const answered = new Map(((rest.length ? await call('lookup', { texts: rest }) : {}).results || []).map((x) => [x.text, x]));
+  for (const text of texts) {
+    const x = Object.hasOwn(local, text)
+      ? { text, key_exists: true, refused: false, translations: Object.fromEntries(targets.filter(([, c]) => String(c[text] ?? '').trim()).map(([code, c]) => [code, c[text]])) }
+      : answered.get(text) || { text };
+    const near = Object.keys(local).filter((k) => k !== text && norm(k) === norm(text));
+    x.similar_keys = [...new Set([...(x.similar_keys || []), ...near])];
     const parts = [x.refused ? 'refused: leave it as written' : x.key_exists ? 'key exists' : 'no key'];
     if (x.similar_keys && x.similar_keys.length) parts.push('similar keys: ' + x.similar_keys.map((k) => JSON.stringify(k)).join(', '));
     const langs = Object.keys(x.translations || {});

@@ -37,8 +37,11 @@ They exit, then start Claude Code again in this repository with
    language, the target languages, the i18n library and call (`__()`, `t()`,
    `$t()`, `$_()`), the catalog folder, and the strings the developers refused
    to localize.
-2. **Before you write new text a person reads**: call `lookup` with those texts
-   (or run `lyngo lookup "<text>" ["<text>"...]`, one line per text).
+2. **Before you write new text a person reads**: run
+   `lyngo lookup "<text>" ["<text>"...]` (one line per text). It reads the
+   working tree's catalogs first, so it also finds keys that are not pushed
+   yet. The MCP `lookup` tool reads only the repository: use it only when the
+   `lyngo` command cannot run.
    - `key_exists: true`: write the i18n call with exactly that key.
    - `similar_keys` not empty: reuse one of them instead of adding a near
      duplicate ("Save" next to "save" or "Save.").

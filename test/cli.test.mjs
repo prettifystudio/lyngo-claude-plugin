@@ -913,11 +913,43 @@ test('lookup prints one line per text: key exists, similar keys, refused, the la
     '"Hello there": no key',
     '',
   ].join('\n'));
-  const c = calls.find((x) => x.path === '/mcp/admin');
+  const c = calls.find((x) => x.path === '/mcp/admin' && x.body.params.name === 'lookup');
   assert.deepEqual(c.body.params, { name: 'lookup', arguments: { texts: ['Save', 'save.', 'Admin', 'Hello there'] } });
   const none = await run(['lookup'], { cwd: repo });
   assert.equal(none.code, 1);
   assert.match(none.stderr, /usage: lyngo lookup/);
+});
+
+test('lookup answers the texts the working tree\'s primary catalogs hold from disk, nested keys and the frontend folder too, and sends only the rest; near matches on disk join the server\'s', async () => {
+  loggedIn();
+  const repo = makeRepo();
+  // Keys a run created and nobody committed or pushed: the server cannot see them.
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), JSON.stringify({ Preview: 'Preview', Save: 'Save', nav: { home: 'Home' } }));
+  fs.writeFileSync(path.join(repo, 'lang', 'fr.json'), JSON.stringify({ Preview: 'Aperçu', Save: '' }));
+  fs.mkdirSync(path.join(repo, 'resources', 'js', 'locales'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'resources', 'js', 'locales', 'en.json'), JSON.stringify({ Dashboard: 'Dashboard' }));
+  reset({ jsCatalogFolder: 'resources/js/locales' });
+  const r = await run(['lookup', 'Preview', 'Save', 'nav.home', 'Dashboard', 'preview!', 'Admin', 'Hello there'], { cwd: path.join(repo, 'resources') });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout, [
+    '"Preview": key exists; translated: fr',
+    '"Save": key exists',
+    '"nav.home": key exists',
+    '"Dashboard": key exists',
+    '"preview!": no key; similar keys: "Preview"',
+    '"Admin": refused: leave it as written',
+    '"Hello there": no key',
+    '',
+  ].join('\n'));
+  const lookups = mcpCalls().filter((x) => x.body.params.name === 'lookup');
+  assert.deepEqual(lookups.map((x) => x.body.params.arguments.texts), [['preview!', 'Admin', 'Hello there']]);
+  // Every text on disk: the server's lookup is not called.
+  calls.length = 0;
+  const all = await run(['lookup', 'Preview', 'Dashboard'], { cwd: repo });
+  assert.equal(all.code, 0, all.out);
+  assert.equal(all.stdout, '"Preview": key exists; translated: fr\n"Dashboard": key exists\n');
+  assert.equal(mcpCalls().filter((x) => x.body.params.name === 'lookup').length, 0);
 });
 
 test('init does not warn when the branch is pushed and package.json is clean', async () => {
@@ -1529,6 +1561,23 @@ test('localize prints each flagged key with its file:line and the reason', async
   assert.match(r.stdout, /\n {4}"Old server key"\n/);
 });
 
+test('localize and translate print every flagged key, none cut', async () => {
+  loggedIn();
+  const flagged = Array.from({ length: 14 }, (_, i) => ({ key: `Key ${i}`, reason: 'untranslated', file: 'resources/js/A.tsx', line: i + 1 }));
+  reset({ jobs: {}, localizeReport: { languages: { fr: { translated: 14, from_memory: 0, flagged } } } });
+  const repo = helloRepo();
+  const r = await run(['localize'], { cwd: repo });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(r.stdout.includes(['  fr: 14 translated, 0 from memory; 14 flagged for review', ...flagged.map((f) => `    resources/js/A.tsx:${f.line} "${f.key}": untranslated`)].join('\n') + '\n'), r.stdout);
+  assert.doesNotMatch(r.stdout, /more/);
+  fs.mkdirSync(path.join(repo, 'lang'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'lang', 'en.json'), JSON.stringify({ Hello: 'Hello' }));
+  reset({ translateReport: { languages: { fr: { translated: 1, from_memory: 0, flagged: flagged.map((f) => f.key) } } } });
+  const t = await run(['translate', 'fr'], { cwd: repo });
+  assert.equal(t.code, 0, t.out);
+  assert.ok(t.stdout.includes(flagged.map((f) => `    "${f.key}"`).join('\n') + '\n'), t.stdout);
+});
+
 test('translate prints each flagged key with the reason', async () => {
   loggedIn();
   const repo = makeRepo();
@@ -1637,14 +1686,15 @@ test('localize prints the server warnings once each, after the other report line
   assert.ok(r.stdout.endsWith(['  warnings (3):', ...three.map((w) => '    ' + w)].join('\n') + '\n'), r.stdout);
 });
 
-test('localize shows the first 10 warnings and counts the rest; no warnings, no header', async () => {
+test('localize prints every warning, none cut; no warnings, no header', async () => {
   loggedIn();
   const repo = helloRepo();
   const many = warnings(25);
   reset({ localizeReport: { warnings: many } });
   const r = await run(['localize', '--dry'], { cwd: repo });
   assert.equal(r.code, 0, r.out);
-  assert.ok(r.stdout.endsWith(['  warnings (25):', ...many.slice(0, 10).map((w) => '    ' + w), '    … and 15 more'].join('\n') + '\n'), r.stdout);
+  assert.ok(r.stdout.endsWith(['  warnings (25):', ...many.map((w) => '    ' + w)].join('\n') + '\n'), r.stdout);
+  assert.doesNotMatch(r.stdout, /more/);
   reset();
   const none = await run(['localize', '--dry'], { cwd: repo });
   assert.equal(none.code, 0, none.out);
@@ -1658,6 +1708,28 @@ test('localize --hook passes the warnings to the agent', async () => {
   assert.equal(r.code, 0, r.out);
   const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
   assert.ok(ctx.includes(['  warnings (3):', ...warnings(3).map((w) => '    ' + w)].join('\n') + '\n\nLyngo has already updated'), ctx);
+});
+
+test('a hook report past the clip is cut for the agent, and written whole to a file the agent gives the user; a run by hand prints it all', async () => {
+  loggedIn();
+  const many = warnings(200); // about 9,000 characters, past the 7,000 the agent gets
+  reset({ localizeReport: { warnings: many } });
+  const repo = helloRepo();
+  const r = await run(['localize', '--hook'], { cwd: repo, input: STOP });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.stdout.trim().split('\n').length, 1, 'one JSON object');
+  const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  const m = /\n\nThe report is cut here\. The whole report is in (\S+lyngo-report-\d+\.txt): give the user that path\.\n\nLyngo has already updated/.exec(ctx);
+  assert.ok(m, ctx.slice(-400));
+  assert.ok(ctx.indexOf('\n\nLyngo has already updated') <= 7000, 'the report part stays within the clip');
+  assert.ok(!ctx.includes(many[199]), 'the last warning is past the clip');
+  const whole = fs.readFileSync(m[1], 'utf8');
+  fs.rmSync(m[1]);
+  assert.ok(whole.endsWith(['  warnings (200):', ...many.map((w) => '    ' + w)].join('\n') + '\n'), whole.slice(-300));
+  reset({ localizeReport: { warnings: many } });
+  const byHand = await run(['localize', '--dry'], { cwd: repo });
+  assert.equal(byHand.code, 0, byHand.out);
+  assert.ok(byHand.stdout.endsWith(['  warnings (200):', ...many.map((w) => '    ' + w)].join('\n') + '\n'), byHand.stdout.slice(-300));
 });
 
 test('translate prints the server warnings of every chunk once each', async () => {
@@ -2677,7 +2749,7 @@ const fixedLocale = (site, tail = "('en-US'). Dates there stay in that format in
 const mayBeStored = (site) => `Left as written, may be stored: ${site} 'Untitled'`;
 const rawEcho = (text) => `Left as written: text next to a raw echo, resources/views/x.blade.php:12: ${text}`;
 
-test('localize gives one line to the warnings of one kind that name one site each, in the order they first appear; a group is one line against the cap', async () => {
+test('localize gives one line to the warnings of one kind that name one site each, in the order they first appear', async () => {
   loggedIn();
   const repo = helloRepo();
   const sites = ['utils/formatDate.js:12', 'resources/js/Pages/Teams/Show.vue:138', ...[1, 2, 3, 4, 5].map((n) => `resources/js/a${n}.tsx:3`)];
